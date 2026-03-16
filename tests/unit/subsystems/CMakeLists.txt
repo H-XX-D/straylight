@@ -17,3 +17,10 @@ add_executable(test_entropy_daemon test_entropy_daemon.cpp
 target_link_libraries(test_entropy_daemon PRIVATE straylight-common straylight-hw GTest::gtest_main)
 target_include_directories(test_entropy_daemon PRIVATE ${CMAKE_SOURCE_DIR}/bin/entropy)
 gtest_discover_tests(test_entropy_daemon)
+
+add_executable(test_scheduler test_scheduler.cpp
+    ${CMAKE_SOURCE_DIR}/bin/scheduler/topology.cpp
+    ${CMAKE_SOURCE_DIR}/bin/scheduler/cgroup.cpp)
+target_link_libraries(test_scheduler PRIVATE straylight-common GTest::gtest_main)
+target_include_directories(test_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/bin/scheduler)
+gtest_discover_tests(test_scheduler)
