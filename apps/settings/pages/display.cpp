@@ -17,6 +17,10 @@ namespace fs = std::filesystem;
 
 DisplayPage::DisplayPage() = default;
 
+void DisplayPage::load() {
+    detect();
+}
+
 void DisplayPage::detect() {
     outputs_.clear();
     read_drm_outputs();

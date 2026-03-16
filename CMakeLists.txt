@@ -58,6 +58,11 @@ if(BUILD_SHELL)
     add_subdirectory(apps/wizard)
 endif()
 
+# Widget panels (ML/HPC/System/Research)
+if(BUILD_APPS)
+    add_subdirectory(apps/widgets)
+endif()
+
 # Tests
 if(BUILD_TESTS)
     enable_testing()

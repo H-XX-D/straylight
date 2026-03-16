@@ -3,412 +3,459 @@
  * StrayLight OS — Enclave Page Cache Management
  * Copyright (C) 2026 StrayLight Systems
  *
- * Manages the SGX Enclave Page Cache (EPC) via ENCLS privileged
- * instructions.  Implements the three-stage enclave build sequence:
+ * Manages SGX Enclave Page Cache (EPC) allocations and executes the
+ * privileged ENCLS instructions that build and finalise enclaves:
  *
- *   1. ECREATE — allocate SECS page, define enclave virtual layout
- *   2. EADD    — copy one page from normal memory into EPC + EEXTEND
- *   3. EINIT   — finalise measurement, enable execution
+ *   ECREATE  — initialise the SECS, define the enclave virtual layout
+ *   EADD     — copy one page of code or data from normal memory → EPC
+ *   EEXTEND  — extend the enclave measurement (SHA-256) over 256-byte chunks
+ *   EINIT    — verify SIGSTRUCT, lock measurement, allow EENTER
  *
- * After EINIT the enclave can be entered via EENTER (ring 3).
+ * EPC page allocation on real hardware is managed by the CPU's Memory
+ * Encryption Engine (MEE).  In this driver we model EPC pages as
+ * kernel-allocated struct pages that can be physically mapped; on actual
+ * SGX hardware the OS would configure the EWB/ELB page management instead.
  *
- * SGX ENCLS instruction:
- *   Leaf in EAX, RBX = operand 1, RCX = operand 2, RDX = operand 3.
- *   Return value in EAX: 0 = success, non-zero = SGX_ERROR code.
+ * ENCLS opcode: .byte 0x0f, 0x01, 0xcf
+ *   EAX = leaf selector
+ *   RBX = operand 1 (pointer to input structure, or 0)
+ *   RCX = operand 2 (EPC page linear address)
+ *   RDX = operand 3 (auxiliary pointer, or 0)
+ *   Returns SGX error code in EAX; 0 = success.
  *
- * Reference: Intel SDM Vol. 3D, Chapters 38-40.
+ * Reference: Intel SDM Vol. 3D, §38 (ENCLS Instruction Reference).
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/gfp.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/spinlock.h>
-#include <linux/list.h>
-#include <linux/atomic.h>
 #include <asm/processor.h>
 #include <asm/cpufeature.h>
 
 #include "enclave.h"
 
-/* ---- EPC descriptor table ---------------------------------------------- */
-
-static LIST_HEAD(enclave_list);
-static DEFINE_MUTEX(enclave_mutex);
-static u64 next_enclave_id = 1;
-
-/* ---- CPUID-based SGX feature detection --------------------------------- */
-
 /*
- * SGX is reported in CPUID leaf 7, sub-leaf 0, EBX bit 2.
- * SGX1 capability is in CPUID leaf 0x12, sub-leaf 0, EAX bit 0.
+ * We need access to the per-enclave and per-device structures that live
+ * in enclave_main.c.  Rather than putting them in a separate header
+ * (which risks conflicting with enclave_main's local definitions), we
+ * declare minimal extern structs here that mirror what enclave_main
+ * exposes via forward declarations.
+ *
+ * The structs below MUST remain in sync with enclave_main.c.
  */
-bool sl_epc_detect_sgx(void)
-{
-#ifdef CONFIG_X86_64
-	u32 eax, ebx, ecx, edx;
 
-	/* CPUID.07H:EBX.SGX[bit 2] */
-	cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
-	if (!(ebx & (1U << 2))) {
-		pr_info("straylight-enclave: CPUID.07H SGX bit not set\n");
-		return false;
-	}
+#define SL_SGX_MAX_PAGES        4096
 
-	/* CPUID.12H:EAX.SGX1[bit 0] */
-	cpuid_count(0x12, 0, &eax, &ebx, &ecx, &edx);
-	if (!(eax & (1U << 0))) {
-		pr_info("straylight-enclave: SGX1 capability not available\n");
-		return false;
-	}
+struct sl_sgx_enclave {
+	struct list_head        list;
+	__u32                   id;
+	__u64                   size;
+	__u64                   base_addr;
+	bool                    initialized;
+	unsigned int            nr_pages;
 
-	pr_info("straylight-enclave: SGX1 detected\n");
-	return true;
-#else
-	return false;
-#endif
-}
+	struct page             *epc_pages[SL_SGX_MAX_PAGES];
+	u64                     epc_phys[SL_SGX_MAX_PAGES];
+
+	struct page             *secs_page;
+	u64                     secs_phys;
+
+	u8                      seal_key[16];
+	bool                    seal_key_valid;
+
+	struct mutex            lock;
+};
+
+struct sl_sgx_device {
+	/* We only need the EPC spinlock and counters from here */
+	struct miscdevice       miscdev;   /* keep layout identical */
+	struct list_head        enclave_list;
+	struct mutex            list_lock;
+	__u32                   next_id;
+	bool                    sgx1_supported;
+	bool                    sgx2_supported;
+	u64                     epc_base;
+	u64                     epc_size;
+};
 
 /* ---- ENCLS instruction wrapper ---------------------------------------- */
 
 /*
- * __encls — execute one ENCLS leaf instruction.
+ * __encls_3 — execute an ENCLS leaf with three register operands.
  *
- * @leaf:  EAX  — instruction selector (SGX_ECREATE, SGX_EADD, ...)
- * @rbx:   RBX  — first operand (often a pointer)
- * @rcx:   RCX  — second operand
- * @rdx:   RDX  — third operand
+ * Used for ECREATE, EADD, EINIT which all take RBX, RCX, RDX.
+ * Returns the SGX fault code from EAX (0 = success).
  *
- * Returns the SGX error code from EAX; 0 = success.
- *
- * The ENCLS instruction faults (#UD) if executed on a CPU that does not
- * support SGX.  Callers must gate on sl_epc_detect_sgx() before calling.
+ * Note: the .byte sequence for ENCLS is 0x0F 0x01 0xCF.
+ * Wrapping it in a macro ensures the assembler always emits it even
+ * in translation units compiled without -msgx.
  */
-static __always_inline int __encls(u32 leaf, unsigned long rbx,
-				   unsigned long rcx, unsigned long rdx)
+static __always_inline int __encls_3(u32 leaf,
+				     unsigned long rbx,
+				     unsigned long rcx,
+				     unsigned long rdx)
 {
 	int ret;
 
 	asm volatile(
-		/* Serialise before the privileged instruction */
 		"lfence\n\t"
-		".byte 0x0f, 0x01, 0xcf\n\t" /* ENCLS opcode */
+		".byte 0x0f, 0x01, 0xcf\n\t"   /* ENCLS */
+		"mfence\n\t"
 		: "=a" (ret)
-		: "a" (leaf), "b" (rbx), "c" (rcx), "d" (rdx)
+		: "a"  (leaf),
+		  "b"  (rbx),
+		  "c"  (rcx),
+		  "d"  (rdx)
 		: "memory", "cc"
 	);
 	return ret;
 }
 
-/* ---- Helper: look up enclave by ID ------------------------------------- */
-
-static struct sl_enclave *epc_find_locked(u64 id)
+/*
+ * __encls_1 — ENCLS leaf that uses only RCX (e.g. EEXTEND, EREMOVE).
+ */
+static __always_inline int __encls_1(u32 leaf, unsigned long rcx)
 {
-	struct sl_enclave *enc;
+	int ret;
 
-	list_for_each_entry(enc, &enclave_list, list) {
-		if (enc->id == id)
-			return enc;
-	}
-	return NULL;
+	asm volatile(
+		"lfence\n\t"
+		".byte 0x0f, 0x01, 0xcf\n\t"
+		: "=a" (ret)
+		: "a"  (leaf),
+		  "b"  (0UL),
+		  "c"  (rcx),
+		  "d"  (0UL)
+		: "memory", "cc"
+	);
+	return ret;
 }
 
-/* ---- Module init / exit ----------------------------------------------- */
+/* ---- SGX SECS layout -------------------------------------------------- */
 
-int sl_epc_init(void)
+/*
+ * Minimal SECS fields we populate before ECREATE.
+ * Hardware fills the remainder.  Must be 4 KiB naturally aligned.
+ */
+struct sl_secs {
+	__u64   size;           /* enclave virtual size (power of 2)    */
+	__u64   base;           /* enclave base VA                       */
+	__u32   ssa_frame_size; /* SSA frame size in pages (minimum: 1)  */
+	__u32   miscselect;     /* extended features the CPU will save   */
+	__u8    reserved1[24];
+	__u64   attributes;     /* XFRM and other attribute flags        */
+	__u8    reserved2[136];
+	__u16   isvprodid;
+	__u16   isvsvn;
+	__u8    reserved3[3836];
+} __packed;
+
+static_assert(sizeof(struct sl_secs) == PAGE_SIZE, "SECS must be 4 KiB");
+
+/* ---- SECINFO layout --------------------------------------------------- */
+
+struct sl_secinfo {
+	__u64   flags;
+	__u8    reserved[56];
+} __packed;
+
+static_assert(sizeof(struct sl_secinfo) == 64, "SECINFO must be 64 bytes");
+
+/* ---- PAGEINFO layout -------------------------------------------------- */
+
+/*
+ * PAGEINFO is the RBX operand for EADD.
+ * It bundles source, SECINFO, and EPC destination in one 32-byte struct.
+ */
+struct sl_pageinfo {
+	__u64   linaddr;        /* source page linear address (kernel VA) */
+	__u64   secinfo;        /* physical address of SECINFO             */
+	__u64   secs;           /* physical address of SECS EPC page       */
+	__u64   offset;         /* offset within enclave                   */
+} __packed;
+
+/* ---- EPC page allocator ----------------------------------------------- */
+
+/*
+ * On real SGX hardware the EPC is a protected DRAM region managed by
+ * the MEE.  Pages are allocated via EAUG (SGX2) or pre-assigned at
+ * build time (SGX1).  For this driver we emulate EPC allocation by
+ * grabbing GFP_KERNEL pages and recording their physical addresses.
+ */
+
+int sl_epc_init(struct sl_sgx_device *dev)
 {
-	pr_info("straylight-enclave: EPC manager ready\n");
+	pr_info("straylight-enclave: EPC manager initialised "
+		"(emulated, %llu MiB EPC from CPUID)\n",
+		dev->epc_size >> 20);
 	return 0;
 }
 
-void sl_epc_cleanup(void)
+void sl_epc_cleanup(struct sl_sgx_device *dev)
 {
-	struct sl_enclave *enc, *tmp;
-
-	mutex_lock(&enclave_mutex);
-	list_for_each_entry_safe(enc, tmp, &enclave_list, list) {
-		/*
-		 * EREMOVE each page before freeing the descriptor.
-		 * In production this would walk all EPC pages associated
-		 * with the enclave; here we free the descriptor only.
-		 */
-		list_del(&enc->list);
-		kfree(enc);
-	}
-	mutex_unlock(&enclave_mutex);
+	/* Nothing to tear down in the emulated allocator */
 }
 
-/* ---- SL_SGX_IOC_CREATE — ECREATE -------------------------------------- */
+int sl_epc_alloc_page(struct sl_sgx_device *dev,
+		      struct page **page_out, u64 *phys_out)
+{
+	struct page *page;
+
+	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!page)
+		return -ENOMEM;
+
+	*page_out = page;
+	*phys_out = page_to_phys(page);
+	return 0;
+}
+
+void sl_epc_free_page(struct sl_sgx_device *dev, struct page *page)
+{
+	if (page) {
+		/* Scrub the page before returning to the allocator */
+		void *va = kmap_local_page(page);
+
+		memzero_explicit(va, PAGE_SIZE);
+		kunmap_local(va);
+		__free_page(page);
+	}
+}
+
+/* ---- ECREATE ---------------------------------------------------------- */
 
 /*
- * sl_epc_create — create a new SGX enclave.
+ * sl_epc_ecreate — run ECREATE to initialise the enclave SECS page.
  *
- * Allocates a SECS EPC page, fills it with the caller-supplied
- * parameters, and executes ECREATE.  Returns the new enclave handle
- * via arg->enclave_id.
+ * The caller has already allocated enc->secs_page via sl_epc_alloc_page.
+ * We fill a SECS structure in kernel memory and hand it to ECREATE:
+ *
+ *   ECREATE(EAX=0, RBX=&secs_template, RCX=epc_secs_pa)
+ *
+ * On success, the EPC page at enc->secs_phys is the live SECS.
  */
-long sl_epc_create(struct sl_sgx_create __user *uarg)
+int sl_epc_ecreate(struct sl_sgx_enclave *enc)
 {
-	struct sl_sgx_create params;
-	struct sl_secs *secs = NULL;
-	struct sl_enclave *enc = NULL;
-	int sgx_ret;
-	long ret = 0;
+	struct sl_secs *secs;
+	int ret;
 
-	if (copy_from_user(&params, uarg, sizeof(params)))
-		return -EFAULT;
-
-	/* Validate: base must be page-aligned, size must be power of two */
-	if (!IS_ALIGNED(params.base_addr, PAGE_SIZE)) {
-		pr_debug("straylight-enclave: base_addr not page-aligned\n");
-		return -EINVAL;
-	}
-	if (!is_power_of_2(params.size) || params.size < PAGE_SIZE) {
-		pr_debug("straylight-enclave: invalid enclave size\n");
-		return -EINVAL;
-	}
-
-	/* Allocate and zero a SECS structure (must be 4 KB aligned) */
-	secs = (struct sl_secs *)get_zeroed_page(GFP_KERNEL);
+	secs = kzalloc(sizeof(*secs), GFP_KERNEL);
 	if (!secs)
 		return -ENOMEM;
 
-	secs->size       = params.size;
-	secs->base       = params.base_addr;
-	secs->attributes = params.secs_attr;
-	/*
-	 * SSA frame size of 1 is the minimum for non-debug enclaves.
-	 * The value is encoded in pages.
-	 */
+	secs->size           = enc->size;
+	secs->base           = enc->base_addr;
 	secs->ssa_frame_size = 1;
-
-	/* Allocate the kernel descriptor */
-	enc = kzalloc(sizeof(*enc), GFP_KERNEL);
-	if (!enc) {
-		ret = -ENOMEM;
-		goto err_secs;
-	}
-
-	INIT_LIST_HEAD(&enc->list);
-	atomic_set(&enc->refcount, 1);
-	enc->base       = params.base_addr;
-	enc->size       = params.size;
-	enc->attributes = params.secs_attr;
-	enc->initialized = false;
+	secs->miscselect     = 0;
+	/*
+	 * ATTRIBUTES.DEBUG=0 (production) | ATTRIBUTES.MODE64BIT=1
+	 * 0x0000000000000006  — bit 1=DEBUG, bit 2=MODE64BIT, bit 5=KSS
+	 */
+	secs->attributes     = 0x0000000000000006ULL;
 
 	/*
-	 * ECREATE:
-	 *   EAX = SGX_ECREATE
-	 *   RBX = pointer to SECS in normal memory (4 KB aligned)
-	 *   RCX = address of EPC page to receive SECS
-	 *         (the hardware manages EPC allocation; here we pass the
-	 *          base VA — on real hardware this is an EPC-allocated PA)
+	 * ENCLS[ECREATE]:
+	 *   RBX = linear address of the SECS template (kernel VA)
+	 *   RCX = physical address of the EPC destination page
 	 */
-	sgx_ret = __encls(SGX_ECREATE,
-			  (unsigned long)secs,
-			  (unsigned long)params.base_addr,
-			  0);
-	if (sgx_ret) {
-		pr_debug("straylight-enclave: ECREATE failed with SGX error "
-			 "0x%x\n", sgx_ret);
-		ret = -EIO;
-		goto err_enc;
+	ret = __encls_3(SGX_ECREATE,
+			(unsigned long)secs,
+			enc->secs_phys,
+			0);
+
+	memzero_explicit(secs, sizeof(*secs));
+	kfree(secs);
+
+	if (ret) {
+		pr_debug("straylight-enclave: ECREATE failed SGX error=0x%x "
+			 "(enc base=0x%llx size=0x%llx)\n",
+			 ret, enc->base_addr, enc->size);
+		return -EIO;
 	}
 
-	mutex_lock(&enclave_mutex);
-	enc->id = next_enclave_id++;
-	list_add_tail(&enc->list, &enclave_list);
-	mutex_unlock(&enclave_mutex);
-
-	/* Return the handle to userspace */
-	if (put_user(enc->id, &uarg->enclave_id)) {
-		ret = -EFAULT;
-		goto err_list;
-	}
-
-	free_page((unsigned long)secs);
+	pr_debug("straylight-enclave: ECREATE OK (id=%u base=0x%llx)\n",
+		 enc->id, enc->base_addr);
 	return 0;
-
-err_list:
-	mutex_lock(&enclave_mutex);
-	list_del(&enc->list);
-	mutex_unlock(&enclave_mutex);
-err_enc:
-	kfree(enc);
-err_secs:
-	free_page((unsigned long)secs);
-	return ret;
 }
 
-/* ---- SL_SGX_IOC_ADD_PAGE — EADD + EEXTEND ----------------------------- */
+/* ---- EADD + EEXTEND --------------------------------------------------- */
 
 /*
- * sl_epc_add_page — add one page to an enclave.
+ * sl_epc_eadd — add one page to the enclave and extend the measurement.
  *
- * The source page is read from userspace, an EPC page is allocated,
- * the hardware copies content via EADD, then EEXTEND hashes each
- * 256-byte chunk into the measurement.
+ * @enc:       the enclave context (already past ECREATE)
+ * @offset:    byte offset within the enclave VA (must be page-aligned)
+ * @src:       kernel VA of the source page content
+ * @page_type: SGX_PT_TCS or SGX_PT_REG
+ * @flags:     SECINFO RWX bits
+ *
+ * EADD copies the source page into the EPC and binds it to the enclave
+ * measurement via the SECS.  Each 256-byte chunk must then be extended
+ * with EEXTEND so the CPU includes it in the final MRENCLAVE hash.
  */
-long sl_epc_add_page(struct sl_sgx_add_page __user *uarg)
+int sl_epc_eadd(struct sl_sgx_enclave *enc, u64 offset,
+		void *src, u32 page_type, u64 flags)
 {
-	struct sl_sgx_add_page params;
-	struct sl_enclave *enc;
-	struct sl_secinfo *secinfo = NULL;
-	void *src_page = NULL;
-	int sgx_ret;
-	long ret = 0;
+	struct sl_secinfo *secinfo;
+	struct sl_pageinfo *pageinfo;
+	struct page *epc_page;
+	u64 epc_phys;
 	u64 chunk;
+	int ret;
+	int page_idx;
 
-	if (copy_from_user(&params, uarg, sizeof(params)))
-		return -EFAULT;
-
-	if (!IS_ALIGNED(params.offset, PAGE_SIZE))
+	if (!IS_ALIGNED(offset, PAGE_SIZE))
 		return -EINVAL;
-
-	mutex_lock(&enclave_mutex);
-	enc = epc_find_locked(params.enclave_id);
-	mutex_unlock(&enclave_mutex);
-
-	if (!enc)
-		return -ENOENT;
-	if (enc->initialized)
-		return -EPERM; /* cannot add pages after EINIT */
-
-	if (params.offset >= enc->size)
+	if (offset >= enc->size)
 		return -ERANGE;
+	if (enc->nr_pages >= SL_SGX_MAX_PAGES)
+		return -ENOSPC;
 
-	/* Copy source page from userspace */
-	src_page = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!src_page)
-		return -ENOMEM;
+	/* Allocate an EPC page for this content */
+	ret = sl_epc_alloc_page(NULL, &epc_page, &epc_phys);
+	if (ret)
+		return ret;
 
-	if (copy_from_user(src_page, (void __user *)params.src_addr,
-			   PAGE_SIZE)) {
-		ret = -EFAULT;
-		goto out_src;
+	/* Copy source content into the EPC page before EADD */
+	{
+		void *dst = kmap_local_page(epc_page);
+
+		memcpy(dst, src, PAGE_SIZE);
+		kunmap_local(dst);
 	}
 
-	/* Allocate SECINFO (must be 64-byte aligned per SDM) */
+	/* Build SECINFO */
 	secinfo = kzalloc(sizeof(*secinfo), GFP_KERNEL);
 	if (!secinfo) {
-		ret = -ENOMEM;
-		goto out_src;
+		sl_epc_free_page(NULL, epc_page);
+		return -ENOMEM;
 	}
-	secinfo->flags = params.secinfo_flags;
-	if (!(secinfo->flags & SECINFO_PT_MASK))
-		secinfo->flags |= SECINFO_PT_REG;  /* default to REG page */
+
+	secinfo->flags = flags & (SGX_SECINFO_R | SGX_SECINFO_W |
+				  SGX_SECINFO_X);
+	switch (page_type) {
+	case SGX_PT_TCS:
+		secinfo->flags |= SGX_SECINFO_PT_TCS;
+		break;
+	case SGX_PT_TRIM:
+		secinfo->flags |= SGX_SECINFO_PT_TRIM;
+		break;
+	default:
+		secinfo->flags |= SGX_SECINFO_PT_REG;
+		break;
+	}
+
+	/* Build PAGEINFO (RBX for EADD) */
+	pageinfo = kzalloc(sizeof(*pageinfo), GFP_KERNEL);
+	if (!pageinfo) {
+		kfree(secinfo);
+		sl_epc_free_page(NULL, epc_page);
+		return -ENOMEM;
+	}
+
+	pageinfo->linaddr = (u64)(unsigned long)src;
+	pageinfo->secinfo = virt_to_phys(secinfo);
+	pageinfo->secs    = enc->secs_phys;
+	pageinfo->offset  = enc->base_addr + offset;
 
 	/*
-	 * EADD:
-	 *   EAX = SGX_EADD
-	 *   RBX = pointer to PAGEINFO structure (SECINFO + source page)
-	 *   RCX = target EPC page address (enclave_base + offset)
-	 *
-	 * For brevity, we pass secinfo directly as RBX and source as RDX;
-	 * a production driver would build a full PAGEINFO struct.
+	 * ENCLS[EADD]:
+	 *   RBX = linear address of PAGEINFO
+	 *   RCX = physical address of the destination EPC page
 	 */
-	sgx_ret = __encls(SGX_EADD,
-			  (unsigned long)secinfo,
-			  enc->base + params.offset,
-			  (unsigned long)src_page);
-	if (sgx_ret) {
-		pr_debug("straylight-enclave: EADD failed 0x%x (offset=%llx)\n",
-			 sgx_ret, params.offset);
+	ret = __encls_3(SGX_EADD,
+			(unsigned long)pageinfo,
+			epc_phys,
+			0);
+	if (ret) {
+		pr_debug("straylight-enclave: EADD failed 0x%x "
+			 "(offset=0x%llx)\n", ret, offset);
 		ret = -EIO;
-		goto out_secinfo;
+		goto out;
 	}
 
 	/*
-	 * EEXTEND: measure each 256-byte chunk of the newly-added page.
-	 *   EAX = SGX_EEXTEND
-	 *   RCX = address of 256-byte region within the EPC page
+	 * ENCLS[EEXTEND]: extend measurement over each 256-byte chunk.
+	 *   RCX = linear address of 256-byte chunk within the EPC page.
 	 */
 	for (chunk = 0; chunk < PAGE_SIZE; chunk += 256) {
-		sgx_ret = __encls(SGX_EEXTEND,
-				  0,
-				  enc->base + params.offset + chunk,
-				  0);
-		if (sgx_ret) {
+		ret = __encls_1(SGX_EEXTEND,
+				epc_phys + chunk);
+		if (ret) {
 			pr_debug("straylight-enclave: EEXTEND failed 0x%x\n",
-				 sgx_ret);
+				 ret);
 			ret = -EIO;
-			goto out_secinfo;
+			goto out;
 		}
 	}
 
-out_secinfo:
+	/* Record the page in the enclave's page table */
+	page_idx = enc->nr_pages;
+	enc->epc_pages[page_idx] = epc_page;
+	enc->epc_phys[page_idx]  = epc_phys;
+	enc->nr_pages++;
+	epc_page = NULL;  /* now owned by enc */
+
+out:
+	kfree(pageinfo);
 	kfree(secinfo);
-out_src:
-	/* Zeroize the temporary copy of the enclave page */
-	memzero_explicit(src_page, PAGE_SIZE);
-	free_page((unsigned long)src_page);
+	if (epc_page)
+		sl_epc_free_page(NULL, epc_page);
 	return ret;
 }
 
-/* ---- SL_SGX_IOC_INIT — EINIT ------------------------------------------ */
+/* ---- EINIT ------------------------------------------------------------ */
 
 /*
- * sl_epc_init_enclave — finalise an enclave.
+ * sl_epc_einit — finalise an enclave after all pages have been added.
  *
- * EINIT verifies the SIGSTRUCT signature against the enclave measurement,
- * checks the launch token (EINITTOKEN), and transitions the SECS to the
- * INITIALIZED state.  After this call the enclave can be entered.
+ * EINIT verifies the SIGSTRUCT RSA signature against the accumulated
+ * MRENCLAVE measurement, checks the launch token (or ignores it on
+ * FLC-enabled platforms), and transitions the SECS to the INITIALIZED
+ * state.  After EINIT succeeds the enclave can be entered via EENTER.
+ *
+ *   EINIT(EAX=2, RBX=sigstruct_va, RCX=secs_epc_pa, RDX=token_va)
+ *
+ * sigstruct: 1808-byte structure (4-KiB alignment strongly recommended)
+ * token:     304-byte EINITTOKEN, or all-zeros on FLC platforms
  */
-long sl_epc_init_enclave(struct sl_sgx_init_param __user *uarg)
+int sl_epc_einit(struct sl_sgx_enclave *enc,
+		 void *sigstruct, void *token)
 {
-	struct sl_sgx_init_param *params;
-	struct sl_enclave *enc;
-	int sgx_ret;
-	long ret = 0;
+	u8 *zero_token = NULL;
+	int ret;
 
-	params = kmalloc(sizeof(*params), GFP_KERNEL);
-	if (!params)
-		return -ENOMEM;
-
-	if (copy_from_user(params, uarg, sizeof(*params))) {
-		ret = -EFAULT;
-		goto out;
-	}
-
-	mutex_lock(&enclave_mutex);
-	enc = epc_find_locked(params->enclave_id);
-	mutex_unlock(&enclave_mutex);
-
-	if (!enc) {
-		ret = -ENOENT;
-		goto out;
-	}
-	if (enc->initialized) {
-		ret = -EALREADY;
-		goto out;
+	/* Use a zero token if none supplied (FLC / launch-control flow) */
+	if (!token) {
+		zero_token = kzalloc(304, GFP_KERNEL);
+		if (!zero_token)
+			return -ENOMEM;
+		token = zero_token;
 	}
 
 	/*
-	 * EINIT:
-	 *   EAX = SGX_EINIT
-	 *   RBX = pointer to SIGSTRUCT (1808 bytes, 4 KB aligned recommended)
-	 *   RCX = address of SECS EPC page (enclave base)
-	 *   RDX = pointer to EINITTOKEN (304 bytes)
+	 * ENCLS[EINIT]:
+	 *   RBX = linear address of SIGSTRUCT
+	 *   RCX = physical address of the SECS EPC page
+	 *   RDX = linear address of EINITTOKEN
 	 */
-	sgx_ret = __encls(SGX_EINIT,
-			  (unsigned long)params->sigstruct,
-			  enc->base,
-			  (unsigned long)params->einittoken);
-	if (sgx_ret) {
-		pr_warn("straylight-enclave: EINIT failed with SGX error "
-			"0x%x (enclave_id=%llu)\n", sgx_ret, enc->id);
-		ret = -EIO;
-		goto out;
+	ret = __encls_3(SGX_EINIT,
+			(unsigned long)sigstruct,
+			enc->secs_phys,
+			(unsigned long)token);
+
+	kfree(zero_token);
+
+	if (ret) {
+		pr_warn("straylight-enclave: EINIT failed SGX error=0x%x "
+			"(enc id=%u)\n", ret, enc->id);
+		return -EIO;
 	}
 
-	enc->initialized = true;
-	pr_info("straylight-enclave: enclave %llu initialized\n", enc->id);
-
-out:
-	/* Zeroize the sensitive key material before freeing */
-	memzero_explicit(params->sigstruct, sizeof(params->sigstruct));
-	memzero_explicit(params->einittoken, sizeof(params->einittoken));
-	kfree(params);
-	return ret;
+	pr_info("straylight-enclave: enclave %u EINIT OK\n", enc->id);
+	return 0;
 }

@@ -2,6 +2,8 @@
 // Input settings — keyboard layout, repeat rate, mouse, touchpad
 #pragma once
 
+#include "../settings_page.h"
+
 #include <straylight/result.h>
 
 #include <string>
@@ -33,12 +35,14 @@ struct InputSettings {
 };
 
 /// Input settings page.
-class InputPage {
+class InputPage : public SettingsPage {
 public:
     InputPage();
 
+    [[nodiscard]] const char* label() const override { return "Input"; }
+
     /// Load current input settings.
-    void load();
+    void load() override;
 
     /// Apply input settings.
     Result<void, std::string> apply();
@@ -47,7 +51,7 @@ public:
     Result<void, std::string> save();
 
     /// Render the input settings page in ImGui.
-    void render();
+    void render() override;
 
     [[nodiscard]] const InputSettings& settings() const { return settings_; }
 

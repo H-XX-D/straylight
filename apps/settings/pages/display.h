@@ -2,6 +2,8 @@
 // Display settings — resolution, refresh rate, scaling
 #pragma once
 
+#include "../settings_page.h"
+
 #include <straylight/result.h>
 
 #include <string>
@@ -33,19 +35,22 @@ struct DisplayOutput {
     int current_mode_index = 0;
 };
 
-/// Display settings page.
-class DisplayPage {
+/// Display settings page — detects outputs from DRM sysfs and applies
+/// configuration via wlr-output-management or compositor IPC.
+class DisplayPage : public SettingsPage {
 public:
     DisplayPage();
 
-    /// Detect connected displays.
-    void detect();
+    [[nodiscard]] const char* label() const override { return "Display"; }
+
+    /// Detect connected displays and populate outputs_.
+    void load() override;
+
+    /// Render the display settings page in ImGui.
+    void render() override;
 
     /// Apply display configuration via wlr-output-management protocol.
     Result<void, std::string> apply();
-
-    /// Render the display settings page in ImGui.
-    void render();
 
     /// Get the outputs.
     [[nodiscard]] const std::vector<DisplayOutput>& outputs() const {
@@ -53,8 +58,8 @@ public:
     }
 
 private:
+    void detect();
     void read_drm_outputs();
-    void read_xrandr_outputs();
 
     std::vector<DisplayOutput> outputs_;
     int selected_output_ = 0;

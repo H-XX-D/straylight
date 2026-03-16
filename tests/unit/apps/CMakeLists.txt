@@ -35,3 +35,17 @@ target_link_libraries(test_wizard_state PRIVATE
     straylight-common
 )
 gtest_discover_tests(test_wizard_state)
+
+# Widget panel tests (registry, GPU HUD parsing, CPU topology parsing)
+add_executable(test_widgets test_widgets.cpp)
+target_include_directories(test_widgets PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/apps/widgets
+    ${CMAKE_SOURCE_DIR}/lib/common/include
+)
+target_link_libraries(test_widgets PRIVATE
+    GTest::gtest_main
+    straylight-widgets
+    straylight-common
+)
+gtest_discover_tests(test_widgets)
