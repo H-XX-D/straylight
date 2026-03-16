@@ -32,3 +32,18 @@ add_executable(test_core test_core.cpp
 target_link_libraries(test_core PRIVATE straylight-common GTest::gtest_main)
 target_include_directories(test_core PRIVATE ${CMAKE_SOURCE_DIR}/bin/core)
 gtest_discover_tests(test_core)
+
+add_executable(test_agent_queue test_agent_queue.cpp
+    ${CMAKE_SOURCE_DIR}/bin/agent/task_queue.cpp)
+target_link_libraries(test_agent_queue PRIVATE straylight-common GTest::gtest_main)
+target_include_directories(test_agent_queue PRIVATE ${CMAKE_SOURCE_DIR}/bin/agent)
+gtest_discover_tests(test_agent_queue)
+
+add_executable(test_compiler test_compiler.cpp
+    ${CMAKE_SOURCE_DIR}/bin/compiler/ir/graph.cpp
+    ${CMAKE_SOURCE_DIR}/bin/compiler/ir/passes.cpp
+    ${CMAKE_SOURCE_DIR}/bin/compiler/ir/lowering.cpp
+    ${CMAKE_SOURCE_DIR}/bin/compiler/cache.cpp)
+target_link_libraries(test_compiler PRIVATE straylight-common GTest::gtest_main)
+target_include_directories(test_compiler PRIVATE ${CMAKE_SOURCE_DIR}/bin/compiler)
+gtest_discover_tests(test_compiler)
