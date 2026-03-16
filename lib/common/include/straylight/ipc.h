@@ -40,6 +40,11 @@ public:
     IpcServer();
     ~IpcServer();
 
+    IpcServer(const IpcServer&) = delete;
+    IpcServer& operator=(const IpcServer&) = delete;
+    IpcServer(IpcServer&&) = delete;
+    IpcServer& operator=(IpcServer&&) = delete;
+
     /// Bind to a socket path and listen.
     Result<void, std::string> bind(const std::string& path);
 

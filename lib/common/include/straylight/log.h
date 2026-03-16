@@ -6,10 +6,7 @@
 #include <string>
 #include <string_view>
 
-// Forward-declare spdlog types to avoid header pollution
-namespace spdlog {
-class logger;
-}
+#include <spdlog/spdlog.h>
 
 namespace straylight {
 

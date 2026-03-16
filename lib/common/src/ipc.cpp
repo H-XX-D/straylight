@@ -41,6 +41,9 @@ IpcConnection& IpcConnection::operator=(IpcConnection&& o) noexcept {
 int IpcConnection::fd() const noexcept { return fd_; }
 
 Result<void, std::string> IpcConnection::send(std::string_view message) {
+    if (message.size() > 16u * 1024 * 1024) {
+        return Result<void, std::string>::error("Message exceeds 16MB limit");
+    }
     uint32_t len = static_cast<uint32_t>(message.size());
     // Send length prefix (4 bytes, network order not needed for local IPC)
     if (::send(fd_, &len, sizeof(len), MSG_NOSIGNAL) != sizeof(len)) {
@@ -90,6 +93,12 @@ IpcServer::~IpcServer() {
 }
 
 Result<void, std::string> IpcServer::bind(const std::string& path) {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        if (!path_.empty()) ::unlink(path_.c_str());
+        fd_ = -1;
+        path_.clear();
+    }
     fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd_ < 0) {
         return Result<void, std::string>::error("socket() failed");
@@ -140,6 +149,7 @@ Result<std::unique_ptr<IpcConnection>, std::string> IpcServer::accept(int timeou
 IpcClient::IpcClient() : IpcConnection(-1) {}
 
 Result<void, std::string> IpcClient::connect(const std::string& path) {
+    if (fd_ >= 0) ::close(fd_);
     fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd_ < 0) {
         return Result<void, std::string>::error("socket() failed");

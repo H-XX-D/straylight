@@ -16,6 +16,11 @@ NodeId Graph::add_input(std::string name, std::vector<int64_t> shape) {
 }
 
 NodeId Graph::add_op(std::string op_type, std::vector<NodeId> inputs, std::string name) {
+    for (auto inp : inputs) {
+        if (inp >= static_cast<NodeId>(nodes_.size())) {
+            throw std::out_of_range("Invalid input node ID: " + std::to_string(inp));
+        }
+    }
     NodeId id = static_cast<NodeId>(nodes_.size());
     if (name.empty()) {
         name = op_type + "_" + std::to_string(id);
@@ -61,6 +66,12 @@ std::vector<NodeId> Graph::topological_order() const {
                 }
             }
         }
+    }
+
+    if (order.size() != nodes_.size()) {
+        throw std::runtime_error("Graph contains a cycle (" +
+            std::to_string(order.size()) + " of " +
+            std::to_string(nodes_.size()) + " nodes reachable)");
     }
 
     return order;

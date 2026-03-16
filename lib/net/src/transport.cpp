@@ -35,6 +35,11 @@ straylight::Result<TensorHeader, std::string> recv_tensor_header(
     if (!r.has_value()) {
         return straylight::Result<TensorHeader, std::string>::error(r.error());
     }
+    if (r.value().bytes_received != sizeof(TensorHeader)) {
+        return straylight::Result<TensorHeader, std::string>::error(
+            "Truncated tensor header: got " + std::to_string(r.value().bytes_received) +
+            " bytes, expected " + std::to_string(sizeof(TensorHeader)));
+    }
     if (hdr.magic != 0x53544C54) {
         return straylight::Result<TensorHeader, std::string>::error("Invalid tensor header magic");
     }

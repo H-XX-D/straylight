@@ -5,6 +5,7 @@ namespace straylight::ml {
 KvCache::KvCache(size_t max_entries) : max_entries_(max_entries) {}
 
 void KvCache::put(const std::string& key, Tensor value) {
+    std::lock_guard lock(mu_);
     auto it = map_.find(key);
     if (it != map_.end()) {
         lru_list_.erase(it->second);
@@ -20,6 +21,7 @@ void KvCache::put(const std::string& key, Tensor value) {
 }
 
 Tensor* KvCache::get(const std::string& key) {
+    std::lock_guard lock(mu_);
     auto it = map_.find(key);
     if (it == map_.end()) return nullptr;
 
@@ -29,6 +31,7 @@ Tensor* KvCache::get(const std::string& key) {
 }
 
 void KvCache::clear() {
+    std::lock_guard lock(mu_);
     lru_list_.clear();
     map_.clear();
 }

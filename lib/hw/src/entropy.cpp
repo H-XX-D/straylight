@@ -28,24 +28,31 @@ EntropySource::~EntropySource() {
 }
 
 straylight::Result<void, std::string> EntropySource::fill(void* buf, size_t len) {
+    auto* dst = static_cast<uint8_t*>(buf);
+    size_t filled = 0;
+
 #ifdef __x86_64__
     if (has_rdrand_ && len <= 4096) {
-        auto* p = static_cast<uint64_t*>(buf);
-        size_t remaining = len;
-        while (remaining >= 8) {
+        while (filled + 8 <= len) {
             unsigned long long val;
             if (_rdrand64_step(&val)) {
-                std::memcpy(p, &val, 8);
-                p++;
-                remaining -= 8;
+                std::memcpy(dst + filled, &val, 8);
+                filled += 8;
             } else {
-                break;  // Fall through to urandom
+                break;  // Fall through to urandom for remainder
             }
         }
-        if (remaining == 0) {
+        // Handle trailing 1-7 bytes
+        if (filled < len && filled + 8 > len) {
+            unsigned long long val;
+            if (_rdrand64_step(&val)) {
+                std::memcpy(dst + filled, &val, len - filled);
+                filled = len;
+            }
+        }
+        if (filled == len) {
             return straylight::Result<void, std::string>::ok();
         }
-        // Handle remaining bytes with urandom below
     }
 #endif
 
@@ -53,14 +60,13 @@ straylight::Result<void, std::string> EntropySource::fill(void* buf, size_t len)
         return straylight::Result<void, std::string>::error("/dev/urandom not available");
     }
 
-    size_t total = 0;
-    auto* dst = static_cast<uint8_t*>(buf);
-    while (total < len) {
-        auto n = ::read(urandom_fd_, dst + total, len - total);
+    // Fill only the remaining unfilled bytes from urandom
+    while (filled < len) {
+        auto n = ::read(urandom_fd_, dst + filled, len - filled);
         if (n <= 0) {
             return straylight::Result<void, std::string>::error("read(/dev/urandom) failed");
         }
-        total += static_cast<size_t>(n);
+        filled += static_cast<size_t>(n);
     }
 
     return straylight::Result<void, std::string>::ok();

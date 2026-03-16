@@ -12,15 +12,18 @@ GpuAllocator::GpuAllocator(GpuBackend backend) : backend_(backend) {
 GpuAllocator::~GpuAllocator() {
     std::lock_guard lock(mu_);
     for (auto& [ptr, size] : allocs_) {
-        if (backend_ == GpuBackend::CPU) {
-            std::free(ptr);
-        }
-        // TODO: CUDA/ROCm/OneAPI free paths
+        // All backends currently use aligned_alloc; route through std::free.
+        // When real GPU backends are added, this must be updated.
+        std::free(ptr);
     }
 }
 
 straylight::Result<void*, std::string> GpuAllocator::allocate(size_t bytes) {
     std::lock_guard lock(mu_);
+
+    if (bytes == 0) {
+        return straylight::Result<void*, std::string>::error("Cannot allocate 0 bytes");
+    }
 
     // aligned_alloc requires size to be a multiple of alignment
     constexpr size_t alignment = 64;  // 64-byte aligned for SIMD/cache lines
@@ -61,10 +64,8 @@ void GpuAllocator::free(void* ptr) {
     stats_.bytes_allocated -= it->second;
     allocs_.erase(it);
 
-    if (backend_ == GpuBackend::CPU) {
-        std::free(ptr);
-    }
-    // TODO: CUDA/ROCm/OneAPI free paths
+    // All backends currently use aligned_alloc; route through std::free.
+    std::free(ptr);
 }
 
 AllocStats GpuAllocator::stats() const {

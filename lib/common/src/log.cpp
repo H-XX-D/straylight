@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
+#include <mutex>
 
 namespace straylight {
 
@@ -39,8 +40,12 @@ void Log::init(std::string_view app_name, Level level) {
 
 std::shared_ptr<spdlog::logger> Log::get() {
     if (!g_logger) {
-        // Lazy init with defaults if init() wasn't called
-        init("straylight", Level::Info);
+        static std::once_flag flag;
+        std::call_once(flag, []() {
+            if (!g_logger) {
+                init("straylight", Level::Info);
+            }
+        });
     }
     return g_logger;
 }

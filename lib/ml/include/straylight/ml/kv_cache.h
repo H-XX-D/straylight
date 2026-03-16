@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <list>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -22,7 +23,10 @@ public:
     Tensor* get(const std::string& key);
 
     /// Number of entries currently in cache.
-    [[nodiscard]] size_t size() const noexcept { return map_.size(); }
+    [[nodiscard]] size_t size() const noexcept {
+        std::lock_guard lock(mu_);
+        return map_.size();
+    }
 
     /// Remove all entries.
     void clear();
@@ -30,6 +34,7 @@ public:
 private:
     void evict();
 
+    mutable std::mutex mu_;
     size_t max_entries_;
 
     // LRU list: front = most recent, back = least recent
