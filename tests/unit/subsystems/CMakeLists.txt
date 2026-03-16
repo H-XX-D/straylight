@@ -11,3 +11,9 @@ add_executable(test_registry test_registry.cpp
 target_link_libraries(test_registry PRIVATE straylight-common GTest::gtest_main)
 target_include_directories(test_registry PRIVATE ${CMAKE_SOURCE_DIR}/bin/registry)
 gtest_discover_tests(test_registry)
+
+add_executable(test_entropy_daemon test_entropy_daemon.cpp
+    ${CMAKE_SOURCE_DIR}/bin/entropy/drbg.cpp)
+target_link_libraries(test_entropy_daemon PRIVATE straylight-common straylight-hw GTest::gtest_main)
+target_include_directories(test_entropy_daemon PRIVATE ${CMAKE_SOURCE_DIR}/bin/entropy)
+gtest_discover_tests(test_entropy_daemon)

@@ -32,6 +32,7 @@ add_subdirectory(lib/hw)
 if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/bus)
     add_subdirectory(bin/registry)
+    add_subdirectory(bin/entropy)
 endif()
 
 # Tests
