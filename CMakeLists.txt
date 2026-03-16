@@ -31,6 +31,7 @@ add_subdirectory(lib/hw)
 # Subsystem daemons
 if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/bus)
+    add_subdirectory(bin/registry)
 endif()
 
 # Tests
