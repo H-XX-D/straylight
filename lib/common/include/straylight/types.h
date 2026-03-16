@@ -72,9 +72,9 @@ struct TensorDesc {
 
 /// Subsystem health status.
 enum class HealthStatus : uint8_t {
-    Ok = 0,
+    Healthy = 0,
     Degraded = 1,
-    Error = 2,
+    Failed = 2,
     Unknown = 3,
 };
 

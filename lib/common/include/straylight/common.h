@@ -11,3 +11,5 @@
 #include <straylight/config.h>
 #include <straylight/ipc.h>
 #include <straylight/types.h>
+#include <straylight/error.h>
+#include <straylight/daemon.h>

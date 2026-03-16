@@ -5,6 +5,7 @@ add_library(straylight-common SHARED
     src/log.cpp
     src/config.cpp
     src/ipc.cpp
+    src/daemon.cpp
 )
 
 target_include_directories(straylight-common
