@@ -28,6 +28,11 @@ add_subdirectory(lib/ml)
 add_subdirectory(lib/net)
 add_subdirectory(lib/hw)
 
+# Subsystem daemons
+if(BUILD_SUBSYSTEMS)
+    add_subdirectory(bin/bus)
+endif()
+
 # Tests
 if(BUILD_TESTS)
     enable_testing()
