@@ -14,36 +14,35 @@
 #include <linux/miscdevice.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/mutex.h>
-#include <linux/list.h>
+#include <linux/ioctl.h>
 #include <asm/cpufeature.h>
 
 #include "enclave.h"
 
-/* ---- ioctl definitions ------------------------------------------------- */
+/* ---- ioctl request structures ------------------------------------------ */
 
 #define SGX_IOC_MAGIC           'S'
 
 struct sl_sgx_create_req {
-	__u64 size;             /* in: enclave size (must be power of 2) */
-	__u64 base_addr;        /* out: enclave base virtual address */
-	__u32 enclave_id;       /* out: assigned enclave ID */
+	__u64 size;
+	__u64 base_addr;
+	__u32 enclave_id;
 	__u32 flags;
 };
 
 struct sl_sgx_add_page_req {
 	__u32 enclave_id;
-	__u32 page_type;        /* PT_REG, PT_TCS, PT_SECS */
-	__u64 offset;           /* offset within enclave */
-	__u64 src_addr;         /* userspace source page */
-	__u64 flags;            /* SECINFO flags: R, W, X */
+	__u32 page_type;
+	__u64 offset;
+	__u64 src_addr;
+	__u64 flags;
 };
 
 struct sl_sgx_init_req {
 	__u32 enclave_id;
 	__u32 pad;
-	__u64 sigstruct_addr;   /* SIGSTRUCT from userspace */
-	__u64 token_addr;       /* EINITTOKEN (may be NULL) */
+	__u64 sigstruct_addr;
+	__u64 token_addr;
 };
 
 struct sl_sgx_seal_req {
@@ -51,8 +50,8 @@ struct sl_sgx_seal_req {
 	__u32 pad;
 	__u64 plaintext_addr;
 	__u64 plaintext_size;
-	__u64 sealed_addr;      /* out: sealed data */
-	__u64 sealed_size;      /* in/out */
+	__u64 sealed_addr;
+	__u64 sealed_size;
 };
 
 struct sl_sgx_unseal_req {
@@ -60,16 +59,16 @@ struct sl_sgx_unseal_req {
 	__u32 pad;
 	__u64 sealed_addr;
 	__u64 sealed_size;
-	__u64 plaintext_addr;   /* out */
-	__u64 plaintext_size;   /* in/out */
+	__u64 plaintext_addr;
+	__u64 plaintext_size;
 };
 
 struct sl_sgx_report_req {
 	__u32 enclave_id;
 	__u32 pad;
-	__u64 target_info_addr; /* in: TARGETINFO */
-	__u64 report_data_addr; /* in: 64 bytes of user data */
-	__u64 report_addr;      /* out: REPORT (432 bytes) */
+	__u64 target_info_addr;
+	__u64 report_data_addr;
+	__u64 report_addr;
 };
 
 struct sl_sgx_destroy_req {
@@ -94,10 +93,8 @@ static void detect_sgx(struct sl_sgx_device *dev)
 #ifdef CONFIG_X86_64
 	u32 eax, ebx, ecx, edx;
 
-	/* Check CPUID leaf 7 for SGX support */
 	cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
 
-	/* EBX bit 2 = SGX */
 	if (!(ebx & (1U << 2))) {
 		pr_info("straylight-enclave: SGX not supported by CPU\n");
 		return;
@@ -106,7 +103,6 @@ static void detect_sgx(struct sl_sgx_device *dev)
 	dev->sgx1_supported = true;
 	pr_info("straylight-enclave: SGX1 supported\n");
 
-	/* Check for SGX2 */
 	cpuid_count(0x12, 0, &eax, &ebx, &ecx, &edx);
 
 	if (eax & (1U << 0))
@@ -116,7 +112,6 @@ static void detect_sgx(struct sl_sgx_device *dev)
 		pr_info("straylight-enclave: SGX2 dynamic page management\n");
 	}
 
-	/* Enumerate EPC sections via CPUID.12H sub-leaf 2+ */
 	{
 		int subleaf;
 
@@ -165,7 +160,6 @@ static long sgx_ioctl_create(struct sl_sgx_device *dev, unsigned long arg)
 
 	if (req.size < PAGE_SIZE || !is_power_of_2(req.size))
 		return -EINVAL;
-
 	if (req.size > (256ULL << 20))
 		return -EINVAL;
 
@@ -316,8 +310,7 @@ static long sgx_ioctl_seal(struct sl_sgx_device *dev, unsigned long arg)
 
 	if (!enc || !enc->initialized)
 		return -EINVAL;
-
-	if (req.plaintext_size > (1ULL << 20))
+	if (req.plaintext_size > SL_SEAL_MAX_DATA)
 		return -EINVAL;
 
 	plain = kmalloc(req.plaintext_size, GFP_KERNEL);
@@ -375,8 +368,7 @@ static long sgx_ioctl_unseal(struct sl_sgx_device *dev, unsigned long arg)
 
 	if (!enc || !enc->initialized)
 		return -EINVAL;
-
-	if (req.sealed_size > (1ULL << 20) + 48)
+	if (req.sealed_size > SL_SEAL_MAX_DATA + SL_SEAL_OVERHEAD)
 		return -EINVAL;
 
 	sealed = kmalloc(req.sealed_size, GFP_KERNEL);
@@ -507,22 +499,14 @@ static long sgx_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct sl_sgx_device *dev = filp->private_data;
 
 	switch (cmd) {
-	case SGX_IOC_CREATE:
-		return sgx_ioctl_create(dev, arg);
-	case SGX_IOC_ADD_PAGE:
-		return sgx_ioctl_add_page(dev, arg);
-	case SGX_IOC_INIT:
-		return sgx_ioctl_init(dev, arg);
-	case SGX_IOC_SEAL:
-		return sgx_ioctl_seal(dev, arg);
-	case SGX_IOC_UNSEAL:
-		return sgx_ioctl_unseal(dev, arg);
-	case SGX_IOC_REPORT:
-		return sgx_ioctl_report(dev, arg);
-	case SGX_IOC_DESTROY:
-		return sgx_ioctl_destroy(dev, arg);
-	default:
-		return -ENOTTY;
+	case SGX_IOC_CREATE:    return sgx_ioctl_create(dev, arg);
+	case SGX_IOC_ADD_PAGE:  return sgx_ioctl_add_page(dev, arg);
+	case SGX_IOC_INIT:      return sgx_ioctl_init(dev, arg);
+	case SGX_IOC_SEAL:      return sgx_ioctl_seal(dev, arg);
+	case SGX_IOC_UNSEAL:    return sgx_ioctl_unseal(dev, arg);
+	case SGX_IOC_REPORT:    return sgx_ioctl_report(dev, arg);
+	case SGX_IOC_DESTROY:   return sgx_ioctl_destroy(dev, arg);
+	default:                return -ENOTTY;
 	}
 }
 

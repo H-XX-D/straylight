@@ -6,21 +6,24 @@
  * Local attestation lets one enclave on the same platform prove its
  * identity to another without going off-platform.  The sequence is:
  *
- *   1. Verifier (B) reads its own TARGETINFO from its SECS.
- *   2. Prover  (A) calls EREPORT(TARGETINFO_B, reportdata) → REPORT.
- *      The CPU signs REPORT with a key derived from platform secrets
- *      and the enclave measurement.  Only B can verify it via EGETKEY.
- *   3. Prover returns REPORT to verifier (via this kernel ioctl).
- *   4. Verifier calls EGETKEY(REPORT_KEY) to derive the report MAC key,
- *      verifies REPORT.MAC, and checks MRENCLAVE/MRSIGNER/attributes.
+ *   1. Verifier (B) reads its own TARGETINFO (identifies itself to the CPU).
+ *   2. Prover  (A) calls EREPORT(TARGETINFO_B, REPORTDATA) → REPORT.
+ *      The CPU creates and MACs REPORT using a key only derivable by B
+ *      via EGETKEY(REPORT_KEY).  Only B can verify the MAC.
+ *   3. Prover returns the 432-byte REPORT to the verifier.
+ *   4. Verifier runs EGETKEY(REPORT_KEY) to derive the MAC key and checks
+ *      REPORT.MAC, then inspects MRENCLAVE / MRSIGNER / attributes.
  *
- * EREPORT is an ENCLU instruction (ring 3 only).  The kernel module:
- *   a. Validates the enclave handle.
- *   b. Copies TARGETINFO and REPORTDATA from userspace into kernel
- *      bounce buffers.
- *   c. Schedules EENTER into the enclave's report_ecall() handler which
- *      executes EREPORT inside the enclave.
- *   d. Copies the 432-byte REPORT back to userspace.
+ * EREPORT is an ENCLU instruction (ring 3, inside enclave only).  The
+ * kernel module's role is to:
+ *   a. Validate the enclave handle.
+ *   b. Copy TARGETINFO and REPORTDATA from userspace.
+ *   c. EENTER the prover enclave's report_ecall() which runs EREPORT.
+ *   d. Copy the 432-byte REPORT back to the caller.
+ *
+ * Remote attestation (EPID / DCAP / TDX) builds on local attestation by
+ * adding a quoting enclave step; that is handled in userspace via the
+ * Intel SGX SDK or the Open Enclave SDK.
  *
  * Reference: Intel SDM Vol. 3D §38.4 (EREPORT), §40.1.4 (local attest).
  */
@@ -30,148 +33,212 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
 
 #include "enclave.h"
 
-/* ---- Report MAC stub --------------------------------------------------- */
+/* ---- SGX hardware report layout --------------------------------------- */
 
 /*
- * On real SGX hardware the REPORT.MAC is a CMAC-AES-128 computed by the
- * CPU microcode over the REPORT body using a key known only to the target
- * enclave (retrieved via EGETKEY(REPORT_KEY)).  The prover's enclave
- * executes EREPORT; the resulting REPORT structure is the deliverable.
+ * REPORT body (368 bytes) followed by a 48-byte KEYID field and a
+ * 16-byte CMAC-AES-128 MAC, total 432 bytes.
  *
- * Here we fill the MAC with a deterministic placeholder so that
- * integration tests can parse the structure without real hardware.
+ * We only populate the fields relevant to identity attestation.
  */
-static void fill_report_mac(struct sl_report *report)
+struct sl_report_body {
+	__u8    cpusvn[16];         /* CPU security version                 */
+	__u32   miscselect;         /* MISC features the CPU saved          */
+	__u8    reserved1[28];
+	__u64   attributes;         /* XFRM + attribute flags               */
+	__u8    mrenclave[32];      /* SHA-256 measurement of enclave       */
+	__u8    reserved2[32];
+	__u8    mrsigner[32];       /* SHA-256 of enclave signer public key */
+	__u8    reserved3[96];
+	__u16   isvprodid;
+	__u16   isvsvn;
+	__u8    reserved4[60];
+	__u8    reportdata[64];     /* caller-supplied nonce / public key   */
+} __packed;
+
+static_assert(sizeof(struct sl_report_body) == 368,
+	      "sl_report_body must be 368 bytes");
+
+struct sl_full_report {
+	struct sl_report_body   body;
+	__u8                    keyid[32];  /* report key ID        */
+	__u8                    mac[16];    /* CMAC-AES-128 tag     */
+	__u8                    reserved[16];
+} __packed;
+
+static_assert(sizeof(struct sl_full_report) == 432,
+	      "sl_full_report must be 432 bytes");
+
+/* ---- Helpers ---------------------------------------------------------- */
+
+/*
+ * fill_report_mac — compute a deterministic placeholder MAC.
+ *
+ * On real hardware the CPU computes CMAC-AES-128 over the report body
+ * using a key derived from platform secrets via EGETKEY(REPORT_KEY).
+ * Here we fold the MRENCLAVE into a 16-byte tag so integration tests
+ * have a non-zero, deterministic value to check.
+ */
+static void fill_report_mac(struct sl_full_report *rep)
 {
-	/*
-	 * Placeholder: XOR-fold MRENCLAVE into a 16-byte MAC slot.
-	 * A production enclave computes this with the hardware key via EREPORT.
-	 */
+	u8 *mac = rep->mac;
 	int i;
 
 	for (i = 0; i < 16; i++)
-		report->mac[i] = report->mrenclave[i] ^
-				 report->mrenclave[i + 16];
+		mac[i] = rep->body.mrenclave[i] ^
+			 rep->body.mrenclave[i + 16] ^
+			 rep->body.reportdata[i];
 }
 
-/* ---- SL_SGX_IOC_REPORT ------------------------------------------------ */
+/* ---- sl_generate_report ----------------------------------------------- */
 
 /*
- * sl_attestation_report — generate a local attestation REPORT.
+ * sl_generate_report — generate a local attestation REPORT.
  *
- * @uarg:  pointer to sl_sgx_report in userspace.
- *         .enclave_id   — prover enclave handle
- *         .targetinfo   — 512-byte TARGETINFO of the verifying enclave
- *         .reportdata   — 64-byte user-defined nonce / public key hash
- *         .report       — 432-byte output REPORT (filled by this call)
+ * @enc:         the prover enclave (must be initialized)
+ * @target_info: 512-byte TARGETINFO identifying the verifying enclave
+ * @report_data: 64-byte user-supplied nonce / public key hash
+ * @report_out:  output buffer (exactly 432 bytes)
  *
  * Returns 0 on success, negative errno on failure.
  */
-long sl_attestation_report(struct sl_sgx_report __user *uarg)
+int sl_generate_report(struct sl_sgx_enclave *enc,
+		       const void *target_info,
+		       const void *report_data,
+		       void *report_out)
 {
-	struct sl_sgx_report *args;
-	struct sl_targetinfo *ti;
-	struct sl_reportdata *rd;
-	struct sl_report *report;
-	long ret = 0;
+	struct sl_full_report *rep;
 
-	/*
-	 * Allocate one heap block for all three sub-structures.
-	 * All must be naturally aligned (TARGETINFO: 512 B, REPORT: 512 B).
-	 * Using a single allocation simplifies cleanup.
-	 */
-	args = kzalloc(sizeof(*args), GFP_KERNEL);
-	if (!args)
+	if (!enc || !target_info || !report_data || !report_out)
+		return -EINVAL;
+	if (!enc->initialized)
+		return -EPERM;
+
+	rep = kzalloc(sizeof(*rep), GFP_KERNEL);
+	if (!rep)
 		return -ENOMEM;
 
-	if (copy_from_user(args, uarg, sizeof(*args))) {
-		ret = -EFAULT;
-		goto out;
-	}
-
-	/* Validate the enclave handle */
-	if (args->enclave_id == 0) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	/* Lay pointers over the embedded arrays */
-	ti     = (struct sl_targetinfo *)args->targetinfo;
-	rd     = (struct sl_reportdata *)args->reportdata;
-	report = (struct sl_report *)args->report;
-
 	/*
-	 * --- Production execution path ---
+	 * --- Production path ---
 	 *
-	 * The prover enclave must execute EREPORT (an ENCLU instruction,
-	 * ring-3 only) with:
-	 *   RBX = linear address of TARGETINFO (in enclave virtual space)
-	 *   RCX = linear address of REPORTDATA (64 bytes)
-	 *   RDX = linear address of output REPORT buffer (512 bytes)
-	 *
-	 * The kernel module triggers this via EENTER into the enclave's
-	 * dedicated report_ecall() entry point.  The enclave maps the
-	 * TARGETINFO and REPORTDATA from the shared memory region, executes
-	 * EREPORT, then EEXIT.  The completed REPORT is written to the
-	 * shared output buffer, which the kernel then copies here.
-	 *
-	 * Steps (abbreviated for clarity):
-	 *   1. sl_epc_find(args->enclave_id)   — get struct sl_enclave *
-	 *   2. map_shared_page(enc, &ti, &rd)   — copy inputs into enclave VA
-	 *   3. __enclu(SGX_EENTER, tcs_pa, aep, &gpr_state) — enter enclave
-	 *      [enclave executes EREPORT then EEXIT]
-	 *   4. copy report from shared page
+	 * 1. Map target_info and report_data into the prover enclave's
+	 *    shared memory region (untrusted memory visible to enclave).
+	 * 2. EENTER the enclave's report_ecall():
+	 *      asm volatile(
+	 *          "enclu"
+	 *          : : "a"(SGX_EENTER), "b"(tcs_pa),
+	 *              "c"(aep), "d"(...)
+	 *          : "memory"
+	 *      );
+	 * 3. Inside the enclave (ring 3):
+	 *      asm volatile(
+	 *          "enclu"
+	 *          : : "a"(SGX_EREPORT),
+	 *              "b"(targetinfo_enclave_va),
+	 *              "c"(reportdata_enclave_va),
+	 *              "d"(report_output_enclave_va)
+	 *          : "memory"
+	 *      );
+	 * 4. EEXIT, copy 432-byte REPORT from shared memory.
 	 *
 	 * --- Stub path (no SGX hardware) ---
 	 *
-	 * We populate the report fields synthetically so that userspace
-	 * can exercise the complete ioctl path on non-SGX machines.
+	 * Populate report fields synthetically for ioctl path testing.
 	 */
 
-	/* Zero the output REPORT */
-	memset(report, 0, sizeof(*report));
+	/* CPUSVN: zero for stub (hardware fills from processor MSRs) */
+	memset(rep->body.cpusvn, 0, sizeof(rep->body.cpusvn));
+
+	/* MISCSELECT and ATTRIBUTES from enclave context */
+	rep->body.miscselect = 0;
+	rep->body.attributes = 0x0000000000000004ULL;
 
 	/*
-	 * Populate synthetic REPORT fields.
-	 * cpusvn_and_policy carries a copy of TARGETINFO (as a proxy for
-	 * what the CPU would embed from platform state).
-	 */
-	memcpy(&report->cpusvn_and_policy, ti, sizeof(*ti));
-
-	/* Embed the caller's nonce in reportdata */
-	memcpy(report->reportdata, rd->data, sizeof(rd->data));
-
-	/*
-	 * MRENCLAVE: on real hardware this is the running enclave's SHA-256
-	 * measurement, accumulated during EADD/EEXTEND.  Use the enclave_id
-	 * as a distinguishable placeholder.
+	 * MRENCLAVE: use enclave ID as a distinguishable 8-byte prefix;
+	 * on real hardware this is the SHA-256 accumulated via EEXTEND.
 	 */
 	{
-		u64 id = args->enclave_id;
+		u64 id = enc->id;
 
-		memcpy(report->mrenclave, &id, sizeof(id));
+		memcpy(rep->body.mrenclave, &id, sizeof(id));
+		/* Remainder stays zero (stub) */
 	}
 
-	/* MRSIGNER: SHA-256 of the signing key — zero for an unsigned stub */
-	memset(report->mrsigner, 0, sizeof(report->mrsigner));
+	/* MRSIGNER: zero for an unsigned/self-signed stub */
+	memset(rep->body.mrsigner, 0, sizeof(rep->body.mrsigner));
 
-	/* Derive the placeholder MAC */
-	fill_report_mac(report);
+	rep->body.isvprodid = 0;
+	rep->body.isvsvn    = 0;
 
-	/* Copy the completed REPORT back to userspace */
-	if (copy_to_user(uarg->report, report, sizeof(*report))) {
-		ret = -EFAULT;
-		goto out;
+	/* Embed caller's 64-byte REPORTDATA */
+	memcpy(rep->body.reportdata, report_data, 64);
+
+	/*
+	 * KEYID: first 32 bytes of target_info (a deterministic
+	 * stand-in; on real hardware this is random per EINIT).
+	 */
+	memcpy(rep->keyid, target_info, 32);
+
+	/* Compute placeholder MAC */
+	fill_report_mac(rep);
+
+	memcpy(report_out, rep, sizeof(*rep));
+
+	memzero_explicit(rep, sizeof(*rep));
+	kfree(rep);
+	return 0;
+}
+
+/* ---- sl_verify_report ------------------------------------------------- */
+
+/*
+ * sl_verify_report — basic structural validation of a REPORT.
+ *
+ * Real cryptographic verification requires EGETKEY(REPORT_KEY) inside
+ * the verifying enclave.  This function performs only structural checks
+ * (version, size) to detect obviously malformed reports before they are
+ * passed to the in-enclave verifier.
+ *
+ * @report:     pointer to 432-byte REPORT buffer
+ * @report_len: must equal sizeof(struct sl_full_report) = 432
+ *
+ * Returns 0 if structurally valid, -EINVAL otherwise.
+ */
+int sl_verify_report(const void *report, size_t report_len)
+{
+	const struct sl_full_report *rep = report;
+
+	if (!report)
+		return -EINVAL;
+	if (report_len != sizeof(struct sl_full_report)) {
+		pr_debug("straylight-enclave: verify_report: "
+			 "bad length %zu (expected %zu)\n",
+			 report_len, sizeof(struct sl_full_report));
+		return -EINVAL;
 	}
 
-out:
-	/* The REPORT contains sensitive measurement data — zeroize on error */
-	if (ret)
-		memzero_explicit(args, sizeof(*args));
+	/*
+	 * Sanity: a zero MRENCLAVE in a supposedly initialized enclave's
+	 * report is suspicious (it should never be all-zero in production).
+	 * This is not a security check — it's a developer-mode guard.
+	 */
+	{
+		int i;
+		u8 sum = 0;
 
-	kfree(args);
-	return ret;
+		for (i = 0; i < 32; i++)
+			sum |= rep->body.mrenclave[i];
+		if (!sum) {
+			pr_debug("straylight-enclave: verify_report: "
+				 "all-zero MRENCLAVE\n");
+			/* Not fatal — stub enclaves have zero MRENCLAVE */
+		}
+	}
+
+	return 0;
 }

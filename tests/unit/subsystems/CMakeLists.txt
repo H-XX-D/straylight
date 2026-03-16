@@ -128,3 +128,34 @@ if(IBVERBS_FOUND)
         ${IBVERBS_INCLUDE_DIRS})
     gtest_discover_tests(test_rdma)
 endif()
+
+# --- Plan 7B: Enclave and FUSE subsystems ---
+
+find_package(OpenSSL QUIET)
+
+# Enclave attestation + sealed storage tests (no SGX hardware required)
+if(OpenSSL_FOUND)
+    add_executable(test_enclave_attestation
+        test_enclave_attestation.cpp
+        ${CMAKE_SOURCE_DIR}/bin/enclave/attestation.cpp
+        ${CMAKE_SOURCE_DIR}/bin/enclave/sealed_storage.cpp)
+    target_link_libraries(test_enclave_attestation PRIVATE
+        straylight-common
+        straylight-hw
+        OpenSSL::Crypto
+        GTest::gtest_main)
+    target_include_directories(test_enclave_attestation PRIVATE
+        ${CMAKE_SOURCE_DIR}/bin/enclave)
+    gtest_discover_tests(test_enclave_attestation)
+endif()
+
+# FUSE compression tests (uses internal LZ77 codec — no libfuse3 needed)
+add_executable(test_fuse_compression
+    test_fuse_compression.cpp
+    ${CMAKE_SOURCE_DIR}/bin/fuse/compression.cpp)
+target_link_libraries(test_fuse_compression PRIVATE
+    straylight-common
+    GTest::gtest_main)
+target_include_directories(test_fuse_compression PRIVATE
+    ${CMAKE_SOURCE_DIR}/bin/fuse)
+gtest_discover_tests(test_fuse_compression)

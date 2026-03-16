@@ -150,13 +150,10 @@ install(TARGETS straylight-encryption RUNTIME DESTINATION bin)
 
 ### Task 2.1: engine.h/.cpp — rsync wrapper
 
-- [ ] `BackupProfile` struct: name, source, destination, excludes, compress flag, delete_removed flag
-- [ ] `BackupRun` struct: timestamp, files_transferred, bytes_transferred, success, error_msg
-- [ ] `Engine::build_args(profile, link_dest)` — construct rsync argv: `-a --info=progress2 [-z] [--delete] [--link-dest=] [--exclude=]... src/ dest/YYYY-MM-DD_HHMMSS/`
-- [ ] `Engine::exec_rsync(args, progress)` — fork, dup2 pipe, execvp rsync, read progress2 output (parse `N%`), waitpid
-- [ ] `Engine::run_backup(profile, progress)` — find latest snapshot for `--link-dest`, build_args, exec_rsync, write_manifest
-- [ ] `Engine::history(profile)` — parse `destination/manifest.json`
-- [ ] `Engine::restore(profile, to, snapshot_time)` — rsync from snapshot dir to restore target
+- [ ] `build_args(profile, link_dest)` — rsync argv: `-a --info=progress2 [-z] [--delete] [--link-dest=] [--exclude=]... src/ dest/YYYY-MM-DD_HHMMSS/`
+- [ ] `exec_rsync(args, progress)` — fork, dup2 pipe, execvp, parse progress2 `N%` output, waitpid
+- [ ] `run_backup(profile, progress)` — find latest snapshot for --link-dest, build_args, exec_rsync, write_manifest
+- [ ] `history(profile)` — parse manifest.json; `restore()` — rsync snapshot→target
 
 ```cpp
 // apps/backup/engine.h

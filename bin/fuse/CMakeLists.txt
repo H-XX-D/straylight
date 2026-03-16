@@ -1,32 +1,38 @@
 # bin/fuse/CMakeLists.txt
 # straylight-fuse — Tensor compression FUSE filesystem daemon.
-# libfuse3 is optional; builds in simulation mode without it.
+# Requires libfuse3 and the lz4/zstd compression libraries.
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FUSE3 REQUIRED fuse3)
 
 add_executable(straylight-fuse
     main.cpp
     fuse_daemon.cpp
+    tensor_fs.cpp
     operations.cpp
     compression.cpp
     tensor_format.cpp
     cache.cpp)
 
-target_link_libraries(straylight-fuse PRIVATE straylight-common)
-target_include_directories(straylight-fuse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(straylight-fuse
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${FUSE3_INCLUDE_DIRS})
 
-# Try to find libfuse3.
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(FUSE3 QUIET fuse3)
-    if(FUSE3_FOUND)
-        target_include_directories(straylight-fuse PRIVATE ${FUSE3_INCLUDE_DIRS})
-        target_link_libraries(straylight-fuse PRIVATE ${FUSE3_LIBRARIES})
-        target_compile_definitions(straylight-fuse PRIVATE FUSE_USE_VERSION=31)
-        message(STATUS "straylight-fuse: libfuse3 found")
-    else()
-        message(STATUS "straylight-fuse: libfuse3 not found, simulation mode only")
-    endif()
-else()
-    message(STATUS "straylight-fuse: pkg-config not found, simulation mode only")
-endif()
+target_link_libraries(straylight-fuse
+    PRIVATE
+        straylight-common
+        straylight-ml
+        ${FUSE3_LIBRARIES}
+        lz4
+        zstd)
 
-install(TARGETS straylight-fuse DESTINATION bin)
+# FUSE_USE_VERSION must be defined before any fuse header is included.
+target_compile_definitions(straylight-fuse
+    PRIVATE
+        FUSE_USE_VERSION=35)
+
+target_compile_options(straylight-fuse
+    PRIVATE ${FUSE3_CFLAGS_OTHER})
+
+install(TARGETS straylight-fuse RUNTIME DESTINATION bin)

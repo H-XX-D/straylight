@@ -43,6 +43,8 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/xdp)
     add_subdirectory(bin/dpdk)
     add_subdirectory(bin/rdma_bus)
+    add_subdirectory(bin/enclave)
+    add_subdirectory(bin/fuse)
 endif()
 
 # Compositor
