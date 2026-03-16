@@ -1,0 +1,33 @@
+# services/compositor/straylight-compositor.service
+[Unit]
+Description=StrayLight Wayland Compositor
+Documentation=man:straylight-compositor(1)
+After=straylight-entropy.service straylight-bus.service straylight-core.service
+Requires=straylight-bus.service
+PartOf=graphical-session.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/straylight-compositor
+Restart=on-failure
+RestartSec=2
+
+# Environment
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/run/user/%U /tmp /var/lib/straylight
+
+# Log to journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=straylight-compositor
+
+[Install]
+WantedBy=graphical-session.target

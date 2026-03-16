@@ -7,3 +7,7 @@ add_subdirectory(unit/net)
 add_subdirectory(unit/hw)
 add_subdirectory(unit/subsystems)
 add_subdirectory(integration)
+
+if(BUILD_COMPOSITOR)
+    add_subdirectory(unit/compositor)
+endif()
