@@ -1,0 +1,16 @@
+<!--
+  wlr-layer-shell-unstable-v1.xml
+
+  PLACEHOLDER: This file should be replaced with the actual protocol XML from
+  the wlr-protocols repository at build time:
+  https://gitlab.freedesktop.org/wlroots/wlr-protocols
+
+  Copy from: wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml
+
+  The real protocol defines the zwlr_layer_shell_v1 and zwlr_layer_surface_v1
+  interfaces used by desktop shell components (panels, wallpapers, overlays)
+  to anchor surfaces to screen edges and layers.
+-->
+<protocol name="wlr_layer_shell_unstable_v1">
+  <description summary="placeholder — replace with real protocol XML"/>
+</protocol>

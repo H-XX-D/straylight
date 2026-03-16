@@ -37,6 +37,11 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/core)
 endif()
 
+# Compositor
+if(BUILD_COMPOSITOR)
+    add_subdirectory(compositor)
+endif()
+
 # Tests
 if(BUILD_TESTS)
     enable_testing()
