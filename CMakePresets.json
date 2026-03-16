@@ -1,0 +1,57 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "dev",
+            "displayName": "Development",
+            "binaryDir": "${sourceDir}/build/dev",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "BUILD_TESTS": "ON",
+                "ENABLE_SANITIZERS": "ON"
+            }
+        },
+        {
+            "name": "release",
+            "displayName": "Release",
+            "binaryDir": "${sourceDir}/build/release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_TESTS": "OFF"
+            }
+        },
+        {
+            "name": "test",
+            "displayName": "Test with Coverage",
+            "binaryDir": "${sourceDir}/build/test",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "BUILD_TESTS": "ON",
+                "CMAKE_CXX_FLAGS": "--coverage"
+            }
+        },
+        {
+            "name": "package",
+            "displayName": "Packaging",
+            "binaryDir": "${sourceDir}/build/package",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "BUILD_TESTS": "OFF"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "dev", "configurePreset": "dev" },
+        { "name": "release", "configurePreset": "release" },
+        { "name": "test", "configurePreset": "test" },
+        { "name": "package", "configurePreset": "package" }
+    ],
+    "testPresets": [
+        {
+            "name": "dev",
+            "configurePreset": "dev",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}
