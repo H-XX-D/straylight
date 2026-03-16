@@ -1,0 +1,13 @@
+[Unit]
+Description=StrayLight Personalization Wizard
+After=straylight-shell.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/lib/straylight/straylight-wizard-check
+ExecStart=/usr/bin/straylight-wizard
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target

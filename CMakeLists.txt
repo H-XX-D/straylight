@@ -42,6 +42,14 @@ if(BUILD_COMPOSITOR)
     add_subdirectory(compositor)
 endif()
 
+# Shell, Greeter, OOBE, Wizard
+if(BUILD_SHELL)
+    add_subdirectory(shell)
+    add_subdirectory(apps/greeter)
+    add_subdirectory(apps/oobe)
+    add_subdirectory(apps/wizard)
+endif()
+
 # Tests
 if(BUILD_TESTS)
     enable_testing()

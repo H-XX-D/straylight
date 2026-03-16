@@ -1,0 +1,51 @@
+#!/bin/bash
+# straylight-firstboot — first-boot initialization script (no UI)
+# Installed to /usr/lib/straylight/straylight-firstboot
+set -euo pipefail
+
+STATE_FILE="${STATE_FILE:-/var/lib/straylight/state}"
+LOG_TAG="straylight-firstboot"
+
+log() {
+    echo "${LOG_TAG}: $*" | systemd-cat -t "${LOG_TAG}" 2>/dev/null || echo "${LOG_TAG}: $*"
+}
+
+# Read current state
+if [ ! -f "${STATE_FILE}" ]; then
+    log "State file not found, exiting"
+    exit 0
+fi
+
+STATE=$(cat "${STATE_FILE}")
+if [ "${STATE}" != "firstboot" ]; then
+    log "State is '${STATE}', not 'firstboot' — nothing to do"
+    exit 0
+fi
+
+log "Starting first-boot initialization"
+
+# Step 1: Commit machine ID
+log "Step 1: systemd-machine-id-setup --commit"
+systemd-machine-id-setup --commit 2>/dev/null || true
+
+# Step 2: Generate SSH host keys
+log "Step 2: Generating SSH host keys"
+ssh-keygen -A 2>/dev/null || true
+
+# Step 3: Rebuild DKMS modules
+log "Step 3: DKMS autoinstall"
+dkms autoinstall 2>/dev/null || true
+
+# Step 4: Apply sysctl settings
+log "Step 4: Applying sysctl settings"
+sysctl --system 2>/dev/null || true
+
+# Step 5: Transition state to 'oobe'
+log "Step 5: Transitioning state to 'oobe'"
+TMPFILE="${STATE_FILE}.tmp"
+echo -n "oobe" > "${TMPFILE}"
+sync "${TMPFILE}"
+mv "${TMPFILE}" "${STATE_FILE}"
+
+log "First-boot initialization complete — state is now 'oobe'"
+exit 0

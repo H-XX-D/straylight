@@ -11,3 +11,8 @@ add_subdirectory(integration)
 if(BUILD_COMPOSITOR)
     add_subdirectory(unit/compositor)
 endif()
+
+if(BUILD_SHELL)
+    add_subdirectory(unit/shell)
+    add_subdirectory(unit/apps)
+endif()
