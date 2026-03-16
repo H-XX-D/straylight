@@ -34,6 +34,7 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/registry)
     add_subdirectory(bin/entropy)
     add_subdirectory(bin/scheduler)
+    add_subdirectory(bin/core)
 endif()
 
 # Tests

@@ -24,3 +24,11 @@ add_executable(test_scheduler test_scheduler.cpp
 target_link_libraries(test_scheduler PRIVATE straylight-common GTest::gtest_main)
 target_include_directories(test_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/bin/scheduler)
 gtest_discover_tests(test_scheduler)
+
+add_executable(test_core test_core.cpp
+    ${CMAKE_SOURCE_DIR}/bin/core/pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/bin/core/doctor.cpp
+    ${CMAKE_SOURCE_DIR}/bin/core/core_daemon.cpp)
+target_link_libraries(test_core PRIVATE straylight-common GTest::gtest_main)
+target_include_directories(test_core PRIVATE ${CMAKE_SOURCE_DIR}/bin/core)
+gtest_discover_tests(test_core)
