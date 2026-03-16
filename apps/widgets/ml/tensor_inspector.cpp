@@ -1,7 +1,10 @@
 // apps/widgets/ml/tensor_inspector.cpp
 #include "tensor_inspector.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::TensorInspectorWidget, "tensor_inspector", "Tensor Inspector", straylight::widgets::WidgetCategory::ML);
 #include <algorithm>
 #include <cstdio>
 #include <numeric>

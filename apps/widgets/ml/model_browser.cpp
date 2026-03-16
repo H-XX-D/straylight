@@ -1,7 +1,10 @@
 // apps/widgets/ml/model_browser.cpp
 #include "model_browser.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::ModelBrowserWidget, "model_browser", "Model Browser", straylight::widgets::WidgetCategory::ML);
 #include <cstdio>
 
 namespace straylight::widgets {

@@ -1,7 +1,10 @@
 // apps/widgets/ml/gpu_hud.cpp
 #include "gpu_hud.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::GpuHudWidget, "gpu_hud", "GPU HUD", straylight::widgets::WidgetCategory::ML);
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

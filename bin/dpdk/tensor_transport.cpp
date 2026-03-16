@@ -24,15 +24,13 @@ void TensorTransport::set_mtu(uint16_t mtu) noexcept {
 }
 
 uint16_t TensorTransport::payload_per_fragment() const noexcept {
-    uint16_t header_overhead = ETH_HEADER_SIZE +
-                               static_cast<uint16_t>(sizeof(TensorFragmentHeader));
-    if (mtu_ <= header_overhead) {
+    // mtu_ represents the maximum L3/L4 payload (excluding Ethernet header).
+    // Within that payload we place our TensorFragmentHeader + actual tensor data.
+    auto hdr_sz = static_cast<uint16_t>(sizeof(TensorFragmentHeader));
+    if (mtu_ <= hdr_sz) {
         return 1; // degenerate but safe
     }
-    return mtu_ - header_overhead + ETH_HEADER_SIZE;
-    // Actually: mtu_ is the L2 payload size. We put eth_hdr + tensor_hdr + payload
-    // into the packet. The total frame must fit in mtu_ + ETH_HEADER_SIZE.
-    // Payload = mtu_ - sizeof(TensorFragmentHeader)
+    return mtu_ - hdr_sz;
 }
 
 Result<void, std::string> TensorTransport::send_tensor(uint16_t port_id,

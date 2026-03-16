@@ -1,7 +1,10 @@
 // apps/widgets/ml/training_dashboard.cpp
 #include "training_dashboard.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::TrainingDashboardWidget, "training_dashboard", "Training Dashboard", straylight::widgets::WidgetCategory::ML);
 #include <algorithm>
 #include <cstdio>
 

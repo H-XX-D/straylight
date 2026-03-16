@@ -1,7 +1,10 @@
 // apps/widgets/ml/inference_monitor.cpp
 #include "inference_monitor.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::InferenceMonitorWidget, "inference_monitor", "Inference Monitor", straylight::widgets::WidgetCategory::ML);
 #include <algorithm>
 #include <cstdio>
 

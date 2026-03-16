@@ -40,6 +40,9 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/morph)
     add_subdirectory(bin/snn)
     add_subdirectory(bin/rhem)
+    add_subdirectory(bin/xdp)
+    add_subdirectory(bin/dpdk)
+    add_subdirectory(bin/rdma_bus)
 endif()
 
 # Compositor

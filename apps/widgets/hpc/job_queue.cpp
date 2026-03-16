@@ -1,7 +1,10 @@
 // apps/widgets/hpc/job_queue.cpp
 #include "job_queue.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::JobQueueWidget, "job_queue", "Job Queue", straylight::widgets::WidgetCategory::HPC);
 #include <cstdio>
 
 namespace straylight::widgets {

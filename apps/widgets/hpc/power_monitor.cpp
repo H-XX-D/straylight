@@ -1,7 +1,10 @@
 // apps/widgets/hpc/power_monitor.cpp
 #include "power_monitor.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::PowerMonitorWidget, "power_monitor", "Power Monitor", straylight::widgets::WidgetCategory::HPC);
 #include <filesystem>
 #include <fstream>
 #include <cstdio>

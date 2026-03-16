@@ -1,7 +1,10 @@
 // apps/widgets/hpc/network_topology.cpp
 #include "network_topology.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::NetworkTopologyWidget, "network_topology", "Network Topology", straylight::widgets::WidgetCategory::HPC);
 #include <cstdio>
 #include <filesystem>
 #include <fstream>

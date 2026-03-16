@@ -1,7 +1,10 @@
 // apps/widgets/system/cpu_topology.cpp
 #include "cpu_topology.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::CpuTopologyWidget, "cpu_topology", "CPU Topology", straylight::widgets::WidgetCategory::System);
 #include <algorithm>
 #include <cstdio>
 #include <fstream>

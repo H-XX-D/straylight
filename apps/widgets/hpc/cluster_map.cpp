@@ -1,7 +1,10 @@
 // apps/widgets/hpc/cluster_map.cpp
 #include "cluster_map.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::ClusterMapWidget, "cluster_map", "Cluster Map", straylight::widgets::WidgetCategory::HPC);
 #include <cstdio>
 #include <algorithm>
 

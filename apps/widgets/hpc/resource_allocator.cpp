@@ -1,7 +1,10 @@
 // apps/widgets/hpc/resource_allocator.cpp
 #include "resource_allocator.h"
+#include "widget_registry.h"
 
 #include <imgui.h>
+
+REGISTER_WIDGET(straylight::widgets::ResourceAllocatorWidget, "resource_allocator", "Resource Allocator", straylight::widgets::WidgetCategory::HPC);
 #include <cstdio>
 
 namespace straylight::widgets {
