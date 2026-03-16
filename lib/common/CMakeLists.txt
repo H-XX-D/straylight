@@ -1,7 +1,9 @@
 find_package(spdlog 1.13 REQUIRED)
+find_package(nlohmann_json 3.11 REQUIRED)
 
 add_library(straylight-common SHARED
     src/log.cpp
+    src/config.cpp
 )
 
 target_include_directories(straylight-common
@@ -11,7 +13,7 @@ target_include_directories(straylight-common
 )
 
 target_link_libraries(straylight-common
-    PUBLIC spdlog::spdlog
+    PUBLIC spdlog::spdlog nlohmann_json::nlohmann_json
 )
 
 set_target_properties(straylight-common PROPERTIES
