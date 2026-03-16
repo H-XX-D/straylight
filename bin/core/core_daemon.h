@@ -5,6 +5,7 @@
 #include <straylight/daemon.h>
 #include "pipeline.h"
 #include "doctor.h"
+#include <mutex>
 #include <unordered_map>
 
 namespace straylight {
@@ -26,6 +27,7 @@ private:
     int restart_max_ = 5;
     std::unordered_map<std::string, int> restart_counts_;
     bool ready_ = false;
+    mutable std::mutex mutex_;  // Guards pipeline_, doctor_, restart_counts_, ready_
 
     void check_readiness();
 };

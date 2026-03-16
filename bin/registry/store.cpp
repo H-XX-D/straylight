@@ -4,11 +4,16 @@
 namespace straylight {
 
 void Store::set(const std::string& key, std::string value) {
+    // Copy watchers under lock, then invoke outside to avoid deadlock
+    // if a callback re-enters set()/del().
+    std::vector<std::function<void(const std::string&)>> callbacks;
     {
         std::unique_lock lock(mutex_);
         data_[key] = value;
+        if (auto it = watchers_.find(key); it != watchers_.end())
+            callbacks = it->second;
     }
-    notify_watchers(key, value);
+    for (auto& cb : callbacks) cb(value);
 }
 
 std::optional<std::string> Store::get(const std::string& key) const {
@@ -48,10 +53,8 @@ Result<void, SLError> Store::deserialize(const std::string& json) {
     }
 }
 
-void Store::notify_watchers(const std::string& key, const std::string& value) {
-    std::shared_lock lock(mutex_);
-    if (auto it = watchers_.find(key); it != watchers_.end())
-        for (auto& cb : it->second) cb(value);
-}
+// notify_watchers removed — watcher invocation is now inlined in set()
+// to avoid TOCTOU race (del() could erase watchers between set's unlock
+// and notify's re-lock).
 
 } // namespace straylight

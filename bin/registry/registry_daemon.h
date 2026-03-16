@@ -17,13 +17,16 @@ public:
     // Expose store for testing
     Store& store() { return store_; }
 
+    /// Mark store as modified (call after set/del via IPC).
+    void mark_dirty() { dirty_ = true; }
+
 private:
     Store store_;
     std::filesystem::path persist_path_;
     bool dirty_ = false;
     std::chrono::steady_clock::time_point last_persist_{};
 
-    void persist();
+    Result<void, SLError> persist();
 };
 
 } // namespace straylight

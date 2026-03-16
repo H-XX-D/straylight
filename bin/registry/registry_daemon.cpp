@@ -27,10 +27,12 @@ Result<void, SLError> RegistryDaemon::init(const Config& cfg) {
 }
 
 Result<void, SLError> RegistryDaemon::tick() {
-    // Persist every 30 seconds
+    // Only persist when data has changed, and at most every 30 seconds
     auto now = std::chrono::steady_clock::now();
-    if (now - last_persist_ > std::chrono::seconds(30)) {
-        persist();
+    if (dirty_ && now - last_persist_ > std::chrono::seconds(30)) {
+        auto r = persist();
+        if (!r.has_value())
+            SL_WARN("registry: periodic persist failed: {}", r.error().message());
         last_persist_ = now;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -38,16 +40,28 @@ Result<void, SLError> RegistryDaemon::tick() {
 }
 
 void RegistryDaemon::shutdown() {
-    persist();
+    if (dirty_) {
+        auto r = persist();
+        if (!r.has_value())
+            SL_ERROR("registry: final persist failed: {}", r.error().message());
+    }
     SL_INFO("registry: shutting down");
 }
 
-void RegistryDaemon::persist() {
+Result<void, SLError> RegistryDaemon::persist() {
     std::ofstream f(persist_path_);
-    if (f) {
-        f << store_.serialize();
-        SL_DEBUG("registry: persisted to {}", persist_path_.string());
-    }
+    if (!f)
+        return Result<void, SLError>::error(
+            SLError{SLErrorCode::IOError,
+                    "cannot open " + persist_path_.string() + " for writing"});
+    f << store_.serialize();
+    if (f.fail())
+        return Result<void, SLError>::error(
+            SLError{SLErrorCode::IOError,
+                    "write failed to " + persist_path_.string()});
+    dirty_ = false;
+    SL_DEBUG("registry: persisted to {}", persist_path_.string());
+    return Result<void, SLError>::ok();
 }
 
 } // namespace straylight

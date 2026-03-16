@@ -19,6 +19,7 @@ enum class SLErrorCode : uint8_t {
     Timeout = 8,
     InvalidArgument = 9,
     Internal = 10,
+    IOError = 11,
 };
 
 /// Structured error type carrying a code and human-readable message.

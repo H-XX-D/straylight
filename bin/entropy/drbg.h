@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace straylight {
@@ -21,6 +22,7 @@ private:
     std::array<uint8_t, 32> key_{};
     std::array<uint8_t, 16> counter_{};
     bool seeded_ = false;
+    mutable std::mutex mutex_;
 
     void update(const std::array<uint8_t, 32>& provided_data);
     void increment_counter();

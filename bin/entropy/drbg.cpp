@@ -23,6 +23,7 @@ void CtrDrbg::update(const std::array<uint8_t, 32>& provided_data) {
 }
 
 Result<void, SLError> CtrDrbg::seed(const std::array<uint8_t, 32>& entropy) {
+    std::lock_guard lock(mutex_);
     key_ = entropy;
     counter_.fill(0);
     increment_counter();
@@ -31,6 +32,7 @@ Result<void, SLError> CtrDrbg::seed(const std::array<uint8_t, 32>& entropy) {
 }
 
 Result<void, SLError> CtrDrbg::reseed(const std::array<uint8_t, 32>& additional) {
+    std::lock_guard lock(mutex_);
     if (!seeded_)
         return Result<void, SLError>::error(
             SLError{SLErrorCode::NotInitialized, "DRBG not seeded"});
@@ -39,6 +41,7 @@ Result<void, SLError> CtrDrbg::reseed(const std::array<uint8_t, 32>& additional)
 }
 
 Result<std::vector<uint8_t>, SLError> CtrDrbg::generate(size_t n_bytes) {
+    std::lock_guard lock(mutex_);
     if (!seeded_)
         return Result<std::vector<uint8_t>, SLError>::error(
             SLError{SLErrorCode::NotInitialized, "DRBG not seeded"});

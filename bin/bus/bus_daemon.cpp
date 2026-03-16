@@ -50,10 +50,16 @@ void BusDaemon::subscribe(const std::string& service, const std::string& signal,
 
 void BusDaemon::emit(const std::string& service, const std::string& signal,
                      const std::string& payload) {
-    std::lock_guard lock(mutex_);
-    auto key = service + "." + signal;
-    if (auto it = subscriptions_.find(key); it != subscriptions_.end())
-        for (auto& h : it->second) h(payload);
+    // Copy handlers under lock, invoke outside to avoid deadlock
+    // if a handler re-enters subscribe()/emit()/register_service().
+    std::vector<SignalHandler> handlers;
+    {
+        std::lock_guard lock(mutex_);
+        auto key = service + "." + signal;
+        if (auto it = subscriptions_.find(key); it != subscriptions_.end())
+            handlers = it->second;
+    }
+    for (auto& h : handlers) h(payload);
 }
 
 } // namespace straylight

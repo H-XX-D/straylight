@@ -128,6 +128,7 @@ void SchedulerDaemon::shutdown() {
 }
 
 void SchedulerDaemon::register_subsystem(const std::string& name, Priority prio) {
+    std::lock_guard lock(mutex_);
     queue_.enqueue(name, prio);
     SL_DEBUG("scheduler: registered subsystem '{}' at priority {}",
              name, static_cast<int>(prio));

@@ -55,10 +55,12 @@ void CoreDaemon::shutdown() {
 }
 
 void CoreDaemon::register_subsystem(const std::string& name, SubsystemPriority prio) {
+    std::lock_guard lock(mutex_);
     pipeline_.register_subsystem(name, prio);
 }
 
 void CoreDaemon::on_health_update(const std::string& name, HealthStatus status) {
+    std::lock_guard lock(mutex_);
     doctor_.record_health(name, status);
 
     // Update the pipeline entry's cached health
@@ -73,6 +75,7 @@ void CoreDaemon::on_health_update(const std::string& name, HealthStatus status) 
 }
 
 bool CoreDaemon::is_ready() const {
+    std::lock_guard lock(mutex_);
     return ready_;
 }
 

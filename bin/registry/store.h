@@ -28,8 +28,6 @@ private:
     std::unordered_map<std::string,
         std::vector<std::function<void(const std::string&)>>> watchers_;
     mutable std::shared_mutex mutex_;
-
-    void notify_watchers(const std::string& key, const std::string& value);
 };
 
 } // namespace straylight

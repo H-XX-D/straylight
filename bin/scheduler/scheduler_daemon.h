@@ -6,6 +6,7 @@
 #include "topology.h"
 #include "cgroup.h"
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,7 @@ private:
     PriorityQueue queue_;
     Topology topology_;
     bool kernel_module_available_ = false;
+    std::mutex mutex_;  // Guards queue_ and apply_priorities()
 
     void apply_priorities();
 };
