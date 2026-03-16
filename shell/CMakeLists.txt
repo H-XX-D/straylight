@@ -10,6 +10,7 @@ set(SHELL_SOURCES
     widgets/volume_osd.cpp
     widgets/screenshot.cpp
     themes/theme_engine.cpp
+    keybinds/keybind_manager.cpp
     settings/display.cpp
     settings/input.cpp
     settings/appearance.cpp
@@ -77,4 +78,10 @@ target_compile_options(straylight-shell PRIVATE
 
 install(TARGETS straylight-shell
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install default keybind configuration to /etc/straylight/
+install(FILES keybinds/default_keybinds.json
+    DESTINATION /etc/straylight
+    RENAME keybinds.json
 )

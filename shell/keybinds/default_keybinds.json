@@ -1,0 +1,73 @@
+[
+  // -------------------------------------------------------------------------
+  // StrayLight OS — Default Global Keybind Configuration
+  // Installed to: /etc/straylight/keybinds.json
+  //
+  // Schema: array of keybind objects, each with:
+  //   "keys"   — modifier+key combo string (e.g. "Super+Return")
+  //              Modifiers: Super, Ctrl, Alt, Shift  (case-insensitive)
+  //              Key names: XKB key name or XF86 multimedia symbol
+  //   "action" — action type (see below)
+  //   "args"   — optional argument string for the action
+  //
+  // Action types:
+  //   "launch"          — fork/exec the program in "args"
+  //   "screenshot"      — capture screen; args: "" (full), "region", "window"
+  //   "volume_up"       — raise system volume one step
+  //   "volume_down"     — lower system volume one step
+  //   "volume_mute"     — toggle mute
+  //   "workspace_N"     — switch to workspace N (1-9); args: "N"
+  //   "close_window"    — close the focused window
+  //   "toggle_launcher" — show/hide the app launcher
+  // -------------------------------------------------------------------------
+
+  // --- Terminal ---
+  { "keys": "Super+Return",       "action": "launch",           "args": "straylight-terminal" },
+  { "keys": "Super+Ctrl+Return",  "action": "launch",           "args": "straylight-terminal --float" },
+
+  // --- App launcher ---
+  { "keys": "Super+Space",        "action": "toggle_launcher" },
+  { "keys": "Super+d",            "action": "toggle_launcher" },
+
+  // --- Window management ---
+  { "keys": "Super+q",            "action": "close_window" },
+  { "keys": "Super+w",            "action": "close_window" },
+  { "keys": "Alt+F4",             "action": "close_window" },
+
+  // --- Screenshots ---
+  { "keys": "Print",              "action": "screenshot",       "args": "" },
+  { "keys": "Super+Print",        "action": "screenshot",       "args": "region" },
+  { "keys": "Shift+Print",        "action": "screenshot",       "args": "window" },
+  { "keys": "Super+Shift+s",      "action": "screenshot",       "args": "region" },
+
+  // --- Volume (keyboard media keys) ---
+  { "keys": "XF86AudioRaiseVolume", "action": "volume_up" },
+  { "keys": "XF86AudioLowerVolume", "action": "volume_down" },
+  { "keys": "XF86AudioMute",        "action": "volume_mute" },
+
+  // --- Volume (Super-based fallback for keyboards without media keys) ---
+  { "keys": "Super+F10",          "action": "volume_mute" },
+  { "keys": "Super+F11",          "action": "volume_down" },
+  { "keys": "Super+F12",          "action": "volume_up" },
+
+  // --- Workspaces 1-9 ---
+  { "keys": "Super+1",            "action": "workspace_1",      "args": "1" },
+  { "keys": "Super+2",            "action": "workspace_2",      "args": "2" },
+  { "keys": "Super+3",            "action": "workspace_3",      "args": "3" },
+  { "keys": "Super+4",            "action": "workspace_4",      "args": "4" },
+  { "keys": "Super+5",            "action": "workspace_5",      "args": "5" },
+  { "keys": "Super+6",            "action": "workspace_6",      "args": "6" },
+  { "keys": "Super+7",            "action": "workspace_7",      "args": "7" },
+  { "keys": "Super+8",            "action": "workspace_8",      "args": "8" },
+  { "keys": "Super+9",            "action": "workspace_9",      "args": "9" },
+
+  // --- Common application shortcuts ---
+  { "keys": "Super+b",            "action": "launch",           "args": "straylight-browser" },
+  { "keys": "Super+e",            "action": "launch",           "args": "straylight-files" },
+  { "keys": "Super+m",            "action": "launch",           "args": "straylight-music" },
+  { "keys": "Super+t",            "action": "launch",           "args": "straylight-taskmanager" },
+
+  // --- Settings ---
+  { "keys": "Super+i",            "action": "launch",           "args": "straylight-settings" },
+  { "keys": "Super+l",            "action": "launch",           "args": "straylight-lock" }
+]
