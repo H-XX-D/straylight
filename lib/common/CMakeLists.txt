@@ -4,6 +4,7 @@ find_package(nlohmann_json 3.11 REQUIRED)
 add_library(straylight-common SHARED
     src/log.cpp
     src/config.cpp
+    src/ipc.cpp
 )
 
 target_include_directories(straylight-common
