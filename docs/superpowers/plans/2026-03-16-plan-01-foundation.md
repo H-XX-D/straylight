@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-03-16-straylight-os-rewrite-design.md`
 
+**Development environment:** Linux x86_64 required. All build and test commands assume a Debian-based system (Bookworm or Trixie). macOS cannot build or test this code — it uses Linux-only APIs (AF_UNIX, sched_setaffinity, /dev/urandom, MSG_NOSIGNAL, etc.).
+
+**Deferred to later plans:** `framework_bridge.h` (Plan 5: ML Subsystems), `pmem.h` implementation (Plan 7: Exotic), `sgx.h` implementation (Plan 7: Exotic). Stub headers with interfaces are created here; real implementations come later.
+
 ---
 
 ## Chunk 1: Build System Skeleton
@@ -261,10 +265,35 @@ IncludeCategories:
     Priority: 3
 ```
 
-- [ ] **Step 6: Commit build system skeleton**
+- [ ] **Step 6: Create .gitignore**
+
+```gitignore
+# Build artifacts
+build/
+*.so
+*.so.*
+*.o
+*.a
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+.cache/
+
+# IDE
+.vscode/
+.idea/
+compile_commands.json
+
+# OS
+.DS_Store
+```
+
+- [ ] **Step 7: Commit build system skeleton**
 
 ```bash
-git add CMakeLists.txt CMakePresets.json cmake/ .clang-format
+git add CMakeLists.txt CMakePresets.json cmake/ .clang-format .gitignore
 git commit -m "build: root CMake build system with presets and shared config"
 ```
 
@@ -501,6 +530,24 @@ private:
     std::variant<T, err_wrapper> storage_;
 };
 
+/// Specialization for void value type (used by IPC, config, etc.).
+template <typename E>
+class Result<void, E> {
+public:
+    static Result ok() { return Result(true); }
+    static Result error(E err) { return Result(std::move(err)); }
+    [[nodiscard]] bool has_value() const noexcept { return ok_; }
+    [[nodiscard]] const E& error() const& {
+        if (ok_) throw std::logic_error("Result::error() called on ok");
+        return err_;
+    }
+private:
+    explicit Result(bool) : ok_(true) {}
+    explicit Result(E err) : ok_(false), err_(std::move(err)) {}
+    bool ok_ = false;
+    E err_{};
+};
+
 } // namespace straylight
 ```
 
@@ -544,7 +591,7 @@ target_include_directories(straylight-ml PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(straylight-ml PUBLIC straylight-common)
 set_target_properties(straylight-ml PROPERTIES VERSION ${STRAYLIGHT_VERSION} SOVERSION ${STRAYLIGHT_SO_VERSION})
-file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/stub.cpp "namespace straylight::ml { void stub() {} }\n")
+# NOTE: Create lib/ml/src/stub.cpp manually (see step below)
 ```
 
 ```cmake
@@ -555,7 +602,7 @@ target_include_directories(straylight-net PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(straylight-net PUBLIC straylight-common)
 set_target_properties(straylight-net PROPERTIES VERSION ${STRAYLIGHT_VERSION} SOVERSION ${STRAYLIGHT_SO_VERSION})
-file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/stub.cpp "namespace straylight::net { void stub() {} }\n")
+# NOTE: Create lib/net/src/stub.cpp manually (see step below)
 ```
 
 ```cmake
@@ -566,7 +613,7 @@ target_include_directories(straylight-hw PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(straylight-hw PUBLIC straylight-common)
 set_target_properties(straylight-hw PROPERTIES VERSION ${STRAYLIGHT_VERSION} SOVERSION ${STRAYLIGHT_SO_VERSION})
-file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/src/stub.cpp "namespace straylight::hw { void stub() {} }\n")
+# NOTE: Create lib/hw/src/stub.cpp manually (see step below)
 ```
 
 - [ ] **Step 9: Build and run tests**
@@ -703,13 +750,10 @@ public:
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 
-#include <mutex>
-
 namespace straylight {
 
 namespace {
 std::shared_ptr<spdlog::logger> g_logger;
-std::once_flag g_init_flag;
 
 spdlog::level::level_enum to_spdlog(Log::Level level) {
     switch (level) {
@@ -1218,21 +1262,6 @@ public:
     Result<void, std::string> connect(const std::string& path);
 };
 
-// Specialization for void value type
-template <typename E>
-class Result<void, E> {
-public:
-    static Result ok() { return Result(true); }
-    static Result error(E err) { return Result(std::move(err)); }
-    [[nodiscard]] bool has_value() const noexcept { return ok_; }
-    [[nodiscard]] const E& error() const& { return err_; }
-private:
-    explicit Result(bool) : ok_(true) {}
-    explicit Result(E err) : ok_(false), err_(std::move(err)) {}
-    bool ok_ = false;
-    E err_{};
-};
-
 } // namespace straylight
 ```
 
@@ -1249,6 +1278,12 @@ private:
 #include <poll.h>
 #include <cstring>
 #include <vector>
+
+// MSG_NOSIGNAL is Linux-only. This code targets Linux x86_64.
+// Guard exists so editors/linters don't flag it on non-Linux dev tools.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 namespace straylight {
 
@@ -1605,7 +1640,14 @@ TEST(TensorTest, DescReturnsCorrectMetadata) {
 }
 ```
 
-- [ ] **Step 2: Implement Tensor**
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+cmake --build build/dev --target test_ml_tensor
+# Expected: FAIL - straylight/ml/tensor.h not found
+```
+
+- [ ] **Step 3: Implement Tensor**
 
 ```cpp
 // lib/ml/include/straylight/ml/tensor.h
@@ -1689,7 +1731,14 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
 } // namespace straylight::ml
 ```
 
-- [ ] **Step 3: Write failing tests for Graph IR**
+- [ ] **Step 4: Run Tensor tests to verify they pass**
+
+```bash
+cmake --build build/dev --target test_ml_tensor && ctest --test-dir build/dev -R TensorTest --output-on-failure
+# Expected: All 4 Tensor tests pass
+```
+
+- [ ] **Step 5: Write failing tests for Graph IR**
 
 ```cpp
 // tests/unit/ml/test_graph.cpp
@@ -1731,7 +1780,14 @@ TEST(GraphTest, TopologicalOrder) {
 }
 ```
 
-- [ ] **Step 4: Implement Graph**
+- [ ] **Step 6: Run Graph tests to verify they fail**
+
+```bash
+cmake --build build/dev --target test_ml_graph
+# Expected: FAIL - straylight/ml/graph.h not found
+```
+
+- [ ] **Step 7: Implement Graph**
 
 ```cpp
 // lib/ml/include/straylight/ml/graph.h
@@ -1857,7 +1913,14 @@ std::vector<NodeId> Graph::topological_order() const {
 } // namespace straylight::ml
 ```
 
-- [ ] **Step 5: Write failing tests for KV Cache**
+- [ ] **Step 8: Run Graph tests to verify they pass**
+
+```bash
+cmake --build build/dev --target test_ml_graph && ctest --test-dir build/dev -R GraphTest --output-on-failure
+# Expected: All 3 Graph tests pass
+```
+
+- [ ] **Step 9: Write failing tests for KV Cache**
 
 ```cpp
 // tests/unit/ml/test_kv_cache.cpp
@@ -1899,7 +1962,14 @@ TEST(KvCacheTest, SizeTracking) {
 }
 ```
 
-- [ ] **Step 6: Implement KV Cache**
+- [ ] **Step 10: Run KV Cache tests to verify they fail**
+
+```bash
+cmake --build build/dev --target test_ml_kv_cache
+# Expected: FAIL - straylight/ml/kv_cache.h not found
+```
+
+- [ ] **Step 11: Implement KV Cache**
 
 ```cpp
 // lib/ml/include/straylight/ml/kv_cache.h
@@ -1993,7 +2063,7 @@ void KvCache::evict() {
 } // namespace straylight::ml
 ```
 
-- [ ] **Step 7: Update lib/ml/CMakeLists.txt**
+- [ ] **Step 12: Update lib/ml/CMakeLists.txt**
 
 ```cmake
 add_library(straylight-ml SHARED
@@ -2018,7 +2088,134 @@ set_target_properties(straylight-ml PROPERTIES
 target_compile_definitions(straylight-ml PRIVATE straylight_ml_EXPORTS)
 ```
 
-- [ ] **Step 8: Create tests/unit/ml/CMakeLists.txt and register**
+- [ ] **Step 13: Create framework_bridge.h stub (interface only, implementation in Plan 5)**
+
+```cpp
+// lib/ml/include/straylight/ml/framework_bridge.h
+#pragma once
+
+#include <straylight/export.h>
+#include <straylight/result.h>
+#include <straylight/ml/tensor.h>
+
+#include <functional>
+#include <string>
+
+namespace straylight::ml {
+
+/// Framework interception bridge for PyTorch, JAX, TensorFlow, ONNX.
+/// Implementation deferred to Plan 5 (ML Subsystems).
+/// This header defines the interface that framework bridge modules will implement.
+enum class Framework : uint8_t {
+    PyTorch = 0,
+    JAX = 1,
+    TensorFlow = 2,
+    ONNX = 3,
+};
+
+/// Callback signature for intercepting framework allocations.
+using AllocInterceptFn = std::function<void*(size_t bytes, int device_id)>;
+using FreeInterceptFn = std::function<void(void* ptr)>;
+
+/// Register an allocation interceptor for a specific framework.
+/// When a framework calls malloc/cudaMalloc, StrayLight's LIR layer
+/// routes it through this interceptor to use VPU slab allocation.
+STRAYLIGHT_EXPORT
+Result<void, std::string> register_alloc_interceptor(
+    Framework fw, AllocInterceptFn alloc_fn, FreeInterceptFn free_fn);
+
+/// Unregister a previously registered interceptor.
+STRAYLIGHT_EXPORT
+Result<void, std::string> unregister_alloc_interceptor(Framework fw);
+
+} // namespace straylight::ml
+```
+
+- [ ] **Step 14: Create pmem.h and sgx.h stub headers (interfaces only, implementation in Plan 7)**
+
+```cpp
+// lib/hw/include/straylight/hw/pmem.h
+#pragma once
+
+#include <straylight/export.h>
+#include <straylight/result.h>
+
+#include <cstddef>
+#include <string>
+
+namespace straylight::hw {
+
+/// Persistent memory (Intel PMEM / CXL) abstraction.
+/// Implementation deferred to Plan 7 (Exotic Subsystems). Requires libpmem2.
+class STRAYLIGHT_EXPORT PmemRegion {
+public:
+    /// Map a DAX device or file to persistent memory.
+    static Result<PmemRegion, std::string> open(const std::string& path);
+
+    /// Get pointer to mapped region.
+    [[nodiscard]] void* data() noexcept;
+    [[nodiscard]] const void* data() const noexcept;
+    [[nodiscard]] size_t size() const noexcept;
+
+    /// Flush writes to persistence.
+    void persist(void* addr, size_t len);
+
+    ~PmemRegion();
+    PmemRegion(PmemRegion&&) noexcept;
+    PmemRegion& operator=(PmemRegion&&) noexcept;
+
+private:
+    PmemRegion() = default;
+    void* data_ = nullptr;
+    size_t size_ = 0;
+};
+
+} // namespace straylight::hw
+```
+
+```cpp
+// lib/hw/include/straylight/hw/sgx.h
+#pragma once
+
+#include <straylight/export.h>
+#include <straylight/result.h>
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace straylight::hw {
+
+/// Intel SGX enclave abstraction.
+/// Implementation deferred to Plan 7 (Exotic Subsystems). Requires Intel SGX SDK.
+class STRAYLIGHT_EXPORT SgxEnclave {
+public:
+    /// Create and initialize an enclave from a signed .so.
+    static Result<SgxEnclave, std::string> create(const std::string& enclave_path);
+
+    /// Call an ECALL (enclave function).
+    Result<std::vector<uint8_t>, std::string> ecall(
+        uint32_t function_id, const void* input, size_t input_len);
+
+    /// Destroy the enclave.
+    void destroy();
+
+    /// Check if SGX is available on this hardware.
+    static bool is_available();
+
+    ~SgxEnclave();
+    SgxEnclave(SgxEnclave&&) noexcept;
+    SgxEnclave& operator=(SgxEnclave&&) noexcept;
+
+private:
+    SgxEnclave() = default;
+    uint64_t enclave_id_ = 0;
+};
+
+} // namespace straylight::hw
+```
+
+- [ ] **Step 15: Create tests/unit/ml/CMakeLists.txt and register**
 
 ```cmake
 # tests/unit/ml/CMakeLists.txt
@@ -2040,7 +2237,7 @@ Add to `tests/CMakeLists.txt`:
 add_subdirectory(unit/ml)
 ```
 
-- [ ] **Step 9: Build and run all tests**
+- [ ] **Step 16: Build and run all tests**
 
 ```bash
 cmake --preset dev
@@ -2049,11 +2246,11 @@ ctest --test-dir build/dev --output-on-failure
 # Expected: All common + ml tests pass
 ```
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 17: Commit**
 
 ```bash
 git add lib/ml/ tests/unit/ml/ tests/CMakeLists.txt
-git commit -m "feat(ml): add Tensor, Graph IR, and LRU KV Cache"
+git commit -m "feat(ml): add Tensor, Graph IR, KV Cache, and framework_bridge interface"
 ```
 
 ---
@@ -2277,16 +2474,19 @@ namespace straylight::net {
 
 /// Wire protocol header for tensor transport.
 /// All multi-byte fields are little-endian.
+/// NOTE: __attribute__((packed)) is GCC/Clang-specific but both are the target
+/// compilers for this Linux-only project. This prevents padding between fields
+/// to ensure consistent wire format across compilations.
 struct __attribute__((packed)) TensorHeader {
     uint32_t magic = 0x53544C54;  // "STLT"
-    uint16_t version = 1;
-    uint8_t dtype;
-    uint8_t ndim;
-    uint64_t data_size;     // payload bytes
-    int64_t shape[8];       // up to 8 dimensions, unused set to 0
+    uint16_t version = 1;         // 2 bytes
+    uint8_t dtype;                // 1 byte
+    uint8_t ndim;                 // 1 byte
+    uint64_t data_size;           // 8 bytes: payload size in bytes
+    int64_t shape[8];             // 64 bytes: up to 8 dimensions, unused set to 0
 };
-
-static_assert(sizeof(TensorHeader) == 4 + 2 + 1 + 1 + 8 + 64, "Packed header size");
+// Total: 4 + 2 + 1 + 1 + 8 + 64 = 80 bytes
+static_assert(sizeof(TensorHeader) == 80, "TensorHeader must be exactly 80 bytes packed");
 
 /// Message types for the StrayLight IPC protocol.
 enum class MessageType : uint8_t {
@@ -2572,16 +2772,20 @@ GpuAllocator::~GpuAllocator() {
 straylight::Result<void*, std::string> GpuAllocator::allocate(size_t bytes) {
     std::lock_guard lock(mu_);
 
+    // aligned_alloc requires size to be a multiple of alignment
+    constexpr size_t alignment = 64;  // 64-byte aligned for SIMD/cache lines
+    size_t aligned_bytes = (bytes + alignment - 1) & ~(alignment - 1);
+
     void* ptr = nullptr;
     switch (backend_) {
         case GpuBackend::CPU:
-            ptr = std::aligned_alloc(64, bytes);  // 64-byte aligned for SIMD
+            ptr = std::aligned_alloc(alignment, aligned_bytes);
             break;
         case GpuBackend::CUDA:
         case GpuBackend::ROCm:
         case GpuBackend::OneAPI:
-            // TODO: real GPU allocation
-            ptr = std::aligned_alloc(64, bytes);
+            // TODO: real GPU allocation via cuMemAlloc/hipMalloc/zeMemAllocDevice
+            ptr = std::aligned_alloc(alignment, aligned_bytes);
             break;
     }
 
@@ -2826,6 +3030,13 @@ set_target_properties(straylight-hw PROPERTIES
 )
 
 target_compile_definitions(straylight-hw PRIVATE straylight_hw_EXPORTS)
+
+# x86 intrinsics for RDRAND/RDSEED entropy
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-mrdrnd HAS_RDRND)
+if(HAS_RDRND)
+    target_compile_options(straylight-hw PRIVATE -mrdrnd)
+endif()
 ```
 
 - [ ] **Step 6: Create tests, build, run**
