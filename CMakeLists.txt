@@ -35,6 +35,11 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/entropy)
     add_subdirectory(bin/scheduler)
     add_subdirectory(bin/core)
+    add_subdirectory(bin/agent)
+    add_subdirectory(bin/compiler)
+    add_subdirectory(bin/morph)
+    add_subdirectory(bin/snn)
+    add_subdirectory(bin/rhem)
 endif()
 
 # Compositor
