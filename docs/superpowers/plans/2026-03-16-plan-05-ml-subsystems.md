@@ -4694,3 +4694,2181 @@ install(TARGETS straylight-morph DESTINATION bin)
 - [ ] `git commit -m "feat(morph): implement quantization, pruning, distillation, and LoRA adaptation"`
 
 ---
+
+## Chunk 6: straylight-snn — Neuron, Network, Plasticity, Simulator
+
+`bin/snn/` — On-demand tool for spiking neural network simulation. Implements Leaky Integrate-and-Fire (LIF) neurons, spike-timing-dependent plasticity (STDP), network topology, and a discrete-time simulator. Links `libstraylight-common` + `libstraylight-ml`.
+
+### File Structure
+
+```
+bin/snn/
+├── CMakeLists.txt
+├── main.cpp
+├── neuron.h
+├── neuron.cpp
+├── network.h
+├── network.cpp
+├── plasticity.h
+├── plasticity.cpp
+├── simulator.h
+└── simulator.cpp
+tests/unit/subsystems/
+└── test_snn.cpp
+```
+
+### Task 1: Failing tests
+
+**File:** `tests/unit/subsystems/test_snn.cpp`
+
+- [ ] **Step 1: Write failing tests**
+
+```cpp
+// tests/unit/subsystems/test_snn.cpp
+#include <gtest/gtest.h>
+#include "neuron.h"
+#include "network.h"
+#include "plasticity.h"
+#include "simulator.h"
+
+using namespace straylight::snn;
+
+// --- Neuron tests ---
+
+TEST(LIFNeuron, SubthresholdDecay) {
+    LIFNeuron n(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                            .v_reset = -75.0f, .tau_m = 20.0f,
+                            .r_m = 10.0f});
+    // Inject current below threshold
+    n.inject_current(1.0f);
+    float v0 = n.membrane_potential();
+    n.step(1.0f);  // 1 ms timestep
+    float v1 = n.membrane_potential();
+
+    // Potential should increase but not spike
+    EXPECT_GT(v1, v0);
+    EXPECT_FALSE(n.has_spiked());
+}
+
+TEST(LIFNeuron, SpikesAboveThreshold) {
+    LIFNeuron n(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                            .v_reset = -75.0f, .tau_m = 20.0f,
+                            .r_m = 10.0f});
+    // Inject large current to trigger spike
+    n.inject_current(100.0f);
+    for (int i = 0; i < 50; ++i) n.step(1.0f);
+
+    EXPECT_TRUE(n.has_spiked());
+}
+
+TEST(LIFNeuron, ResetAfterSpike) {
+    LIFNeuron n(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                            .v_reset = -75.0f, .tau_m = 20.0f,
+                            .r_m = 10.0f});
+    n.inject_current(100.0f);
+    for (int i = 0; i < 100; ++i) n.step(1.0f);
+
+    // After spike, potential should be at reset value
+    if (n.has_spiked()) {
+        EXPECT_NEAR(n.membrane_potential(), -75.0f, 1.0f);
+    }
+}
+
+TEST(LIFNeuron, RefractoryPeriod) {
+    LIFNeuron n(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                            .v_reset = -75.0f, .tau_m = 20.0f,
+                            .r_m = 10.0f, .t_refract = 5.0f});
+    n.inject_current(100.0f);
+    // Drive to spike
+    for (int i = 0; i < 100; ++i) n.step(1.0f);
+    ASSERT_TRUE(n.has_spiked());
+
+    // During refractory period, neuron should not respond
+    n.clear_spike();
+    n.inject_current(100.0f);
+    n.step(1.0f);  // Still in refractory
+    EXPECT_NEAR(n.membrane_potential(), -75.0f, 1.0f);
+}
+
+// --- Network tests ---
+
+TEST(SpikeNetwork, ConnectAndPropagate) {
+    SpikeNetwork net;
+    auto n0 = net.add_neuron(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                                         .v_reset = -75.0f, .tau_m = 20.0f, .r_m = 10.0f});
+    auto n1 = net.add_neuron(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                                         .v_reset = -75.0f, .tau_m = 20.0f, .r_m = 10.0f});
+    net.connect(n0, n1, 50.0f, 1.0f);  // weight=50, delay=1ms
+
+    EXPECT_EQ(net.num_neurons(), 2u);
+    EXPECT_EQ(net.num_synapses(), 1u);
+}
+
+TEST(SpikeNetwork, RecordSpikes) {
+    SpikeNetwork net;
+    auto n0 = net.add_neuron(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                                         .v_reset = -75.0f, .tau_m = 20.0f, .r_m = 10.0f});
+    // Inject strong current into n0
+    net.inject_current(n0, 100.0f);
+
+    Simulator sim(net, 1.0f);
+    sim.run(50.0f);  // 50 ms
+
+    auto spikes = sim.spike_log();
+    // n0 should have spiked at least once
+    bool found = false;
+    for (const auto& [time, nid] : spikes) {
+        if (nid == n0) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+// --- Plasticity tests ---
+
+TEST(STDP, PotentiationPreBeforePost) {
+    STDPRule stdp(STDPParams{.a_plus = 0.01f, .a_minus = 0.012f,
+                               .tau_plus = 20.0f, .tau_minus = 20.0f});
+    float w = 0.5f;
+    // Pre fires at t=10, post fires at t=15 → dt = 5ms → potentiation
+    float dw = stdp.compute_dw(10.0f, 15.0f);
+    EXPECT_GT(dw, 0.0f);
+}
+
+TEST(STDP, DepressionPostBeforePre) {
+    STDPRule stdp(STDPParams{.a_plus = 0.01f, .a_minus = 0.012f,
+                               .tau_plus = 20.0f, .tau_minus = 20.0f});
+    // Post fires at t=10, pre fires at t=15 → dt = -5ms → depression
+    float dw = stdp.compute_dw(15.0f, 10.0f);
+    EXPECT_LT(dw, 0.0f);
+}
+
+TEST(STDP, LargeDelaySmallChange) {
+    STDPRule stdp(STDPParams{.a_plus = 0.01f, .a_minus = 0.012f,
+                               .tau_plus = 20.0f, .tau_minus = 20.0f});
+    float dw_close = stdp.compute_dw(10.0f, 12.0f);    // 2ms apart
+    float dw_far = stdp.compute_dw(10.0f, 50.0f);      // 40ms apart
+    EXPECT_GT(std::abs(dw_close), std::abs(dw_far));
+}
+
+// --- Simulator tests ---
+
+TEST(Simulator, RunReturnsOk) {
+    SpikeNetwork net;
+    net.add_neuron(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                               .v_reset = -75.0f, .tau_m = 20.0f, .r_m = 10.0f});
+    Simulator sim(net, 0.5f);
+    auto r = sim.run(10.0f);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(sim.current_time(), 10.0f);
+}
+
+TEST(Simulator, STDPModifiesWeights) {
+    SpikeNetwork net;
+    auto n0 = net.add_neuron(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                                         .v_reset = -75.0f, .tau_m = 20.0f, .r_m = 10.0f});
+    auto n1 = net.add_neuron(LIFParams{.v_rest = -70.0f, .v_thresh = -55.0f,
+                                         .v_reset = -75.0f, .tau_m = 20.0f, .r_m = 10.0f});
+    net.connect(n0, n1, 0.5f, 1.0f);
+    net.inject_current(n0, 80.0f);
+    net.inject_current(n1, 80.0f);
+
+    STDPRule stdp(STDPParams{.a_plus = 0.01f, .a_minus = 0.012f,
+                               .tau_plus = 20.0f, .tau_minus = 20.0f});
+    Simulator sim(net, 1.0f);
+    sim.enable_stdp(stdp);
+    float w_before = net.synapse_weight(n0, n1);
+    sim.run(100.0f);
+    float w_after = net.synapse_weight(n0, n1);
+
+    // Weight should have changed due to STDP
+    EXPECT_NE(w_before, w_after);
+}
+```
+
+- [ ] **Step 2: Add to `tests/unit/subsystems/CMakeLists.txt`**
+
+```cmake
+add_executable(test_snn test_snn.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/neuron.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/network.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/plasticity.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/simulator.cpp)
+target_include_directories(test_snn PRIVATE ${PROJECT_SOURCE_DIR}/bin/snn)
+target_link_libraries(test_snn PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_snn)
+```
+
+Run: expect 11 failures.
+
+---
+
+### Task 2: Implement neuron
+
+**Files:** `bin/snn/neuron.h`, `bin/snn/neuron.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/snn/neuron.h
+#pragma once
+
+#include <cstdint>
+
+namespace straylight::snn {
+
+using NeuronId = uint32_t;
+
+/// Parameters for a Leaky Integrate-and-Fire neuron.
+struct LIFParams {
+    float v_rest = -70.0f;     // Resting potential (mV)
+    float v_thresh = -55.0f;   // Spike threshold (mV)
+    float v_reset = -75.0f;    // Post-spike reset potential (mV)
+    float tau_m = 20.0f;       // Membrane time constant (ms)
+    float r_m = 10.0f;         // Membrane resistance (MOhm)
+    float t_refract = 2.0f;    // Refractory period (ms)
+};
+
+/// Leaky Integrate-and-Fire neuron model.
+/// dV/dt = -(V - V_rest)/tau_m + R_m * I / tau_m
+/// When V >= V_thresh: spike, V = V_reset, enter refractory.
+class LIFNeuron {
+public:
+    explicit LIFNeuron(LIFParams params);
+
+    /// Inject current (nA) to be applied on the next step.
+    void inject_current(float current);
+
+    /// Advance by dt milliseconds using forward Euler integration.
+    void step(float dt);
+
+    /// Current membrane potential.
+    [[nodiscard]] float membrane_potential() const { return v_; }
+
+    /// Whether the neuron spiked during the last step.
+    [[nodiscard]] bool has_spiked() const { return spiked_; }
+
+    /// Clear the spike flag (call after processing spike events).
+    void clear_spike() { spiked_ = false; }
+
+    /// Last spike time in simulation time.
+    [[nodiscard]] float last_spike_time() const { return last_spike_time_; }
+
+    /// Set simulation time (called by simulator).
+    void set_time(float t) { sim_time_ = t; }
+
+    /// Get parameters (for introspection).
+    [[nodiscard]] const LIFParams& params() const { return params_; }
+
+private:
+    LIFParams params_;
+    float v_;                // Membrane potential
+    float i_inject_ = 0.0f; // Injected current for this step
+    bool spiked_ = false;
+    float last_spike_time_ = -1000.0f;
+    float sim_time_ = 0.0f;
+    float refract_remaining_ = 0.0f;
+};
+
+} // namespace straylight::snn
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/snn/neuron.cpp
+#include "neuron.h"
+
+namespace straylight::snn {
+
+LIFNeuron::LIFNeuron(LIFParams params)
+    : params_(params), v_(params.v_rest) {}
+
+void LIFNeuron::inject_current(float current) {
+    i_inject_ += current;
+}
+
+void LIFNeuron::step(float dt) {
+    spiked_ = false;
+
+    // Refractory period: neuron is clamped at reset voltage
+    if (refract_remaining_ > 0.0f) {
+        refract_remaining_ -= dt;
+        v_ = params_.v_reset;
+        i_inject_ = 0.0f;
+        return;
+    }
+
+    // Forward Euler integration of LIF equation:
+    // dV/dt = (-(V - V_rest) + R_m * I) / tau_m
+    float dv = (-(v_ - params_.v_rest) + params_.r_m * i_inject_) / params_.tau_m;
+    v_ += dv * dt;
+
+    // Clear injected current (consumed this step)
+    i_inject_ = 0.0f;
+
+    // Spike detection
+    if (v_ >= params_.v_thresh) {
+        spiked_ = true;
+        last_spike_time_ = sim_time_;
+        v_ = params_.v_reset;
+        refract_remaining_ = params_.t_refract;
+    }
+}
+
+} // namespace straylight::snn
+```
+
+---
+
+### Task 3: Implement network
+
+**Files:** `bin/snn/network.h`, `bin/snn/network.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/snn/network.h
+#pragma once
+
+#include "neuron.h"
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace straylight::snn {
+
+struct Synapse {
+    NeuronId pre;
+    NeuronId post;
+    float weight;   // Synaptic weight (current injected on pre-spike)
+    float delay;    // Transmission delay (ms)
+};
+
+/// Spiking neural network: collection of neurons and synapses.
+class SpikeNetwork {
+public:
+    /// Add a neuron with the given parameters. Returns its ID.
+    NeuronId add_neuron(LIFParams params);
+
+    /// Connect two neurons with a synapse.
+    void connect(NeuronId pre, NeuronId post, float weight, float delay = 1.0f);
+
+    /// Inject current into a specific neuron.
+    void inject_current(NeuronId id, float current);
+
+    /// Access a neuron by ID.
+    [[nodiscard]] LIFNeuron& neuron(NeuronId id);
+    [[nodiscard]] const LIFNeuron& neuron(NeuronId id) const;
+
+    /// Get all synapses originating from a given neuron.
+    [[nodiscard]] const std::vector<Synapse>& outgoing_synapses(NeuronId id) const;
+
+    /// Get synapse weight between two neurons (0 if not connected).
+    [[nodiscard]] float synapse_weight(NeuronId pre, NeuronId post) const;
+
+    /// Modify a synapse weight (used by STDP).
+    void set_synapse_weight(NeuronId pre, NeuronId post, float weight);
+
+    [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }
+    [[nodiscard]] size_t num_synapses() const;
+
+    /// Get all neuron IDs.
+    [[nodiscard]] std::vector<NeuronId> neuron_ids() const;
+
+    /// Get all synapses (for STDP iteration).
+    [[nodiscard]] std::vector<Synapse*> all_synapses();
+
+private:
+    std::unordered_map<NeuronId, LIFNeuron> neurons_;
+    std::unordered_map<NeuronId, std::vector<Synapse>> adjacency_;
+    NeuronId next_id_ = 0;
+    static const std::vector<Synapse> empty_synapses_;
+};
+
+} // namespace straylight::snn
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/snn/network.cpp
+#include "network.h"
+
+#include <stdexcept>
+
+namespace straylight::snn {
+
+const std::vector<Synapse> SpikeNetwork::empty_synapses_;
+
+NeuronId SpikeNetwork::add_neuron(LIFParams params) {
+    NeuronId id = next_id_++;
+    neurons_.emplace(id, LIFNeuron(params));
+    return id;
+}
+
+void SpikeNetwork::connect(NeuronId pre, NeuronId post, float weight, float delay) {
+    adjacency_[pre].push_back(Synapse{pre, post, weight, delay});
+}
+
+void SpikeNetwork::inject_current(NeuronId id, float current) {
+    auto it = neurons_.find(id);
+    if (it != neurons_.end()) {
+        it->second.inject_current(current);
+    }
+}
+
+LIFNeuron& SpikeNetwork::neuron(NeuronId id) {
+    auto it = neurons_.find(id);
+    if (it == neurons_.end()) throw std::out_of_range("neuron not found");
+    return it->second;
+}
+
+const LIFNeuron& SpikeNetwork::neuron(NeuronId id) const {
+    auto it = neurons_.find(id);
+    if (it == neurons_.end()) throw std::out_of_range("neuron not found");
+    return it->second;
+}
+
+const std::vector<Synapse>& SpikeNetwork::outgoing_synapses(NeuronId id) const {
+    auto it = adjacency_.find(id);
+    if (it == adjacency_.end()) return empty_synapses_;
+    return it->second;
+}
+
+float SpikeNetwork::synapse_weight(NeuronId pre, NeuronId post) const {
+    auto it = adjacency_.find(pre);
+    if (it == adjacency_.end()) return 0.0f;
+    for (const auto& s : it->second) {
+        if (s.post == post) return s.weight;
+    }
+    return 0.0f;
+}
+
+void SpikeNetwork::set_synapse_weight(NeuronId pre, NeuronId post, float weight) {
+    auto it = adjacency_.find(pre);
+    if (it == adjacency_.end()) return;
+    for (auto& s : it->second) {
+        if (s.post == post) { s.weight = weight; return; }
+    }
+}
+
+size_t SpikeNetwork::num_synapses() const {
+    size_t count = 0;
+    for (const auto& [id, syns] : adjacency_) count += syns.size();
+    return count;
+}
+
+std::vector<NeuronId> SpikeNetwork::neuron_ids() const {
+    std::vector<NeuronId> ids;
+    ids.reserve(neurons_.size());
+    for (const auto& [id, _] : neurons_) ids.push_back(id);
+    return ids;
+}
+
+std::vector<Synapse*> SpikeNetwork::all_synapses() {
+    std::vector<Synapse*> result;
+    for (auto& [id, syns] : adjacency_) {
+        for (auto& s : syns) result.push_back(&s);
+    }
+    return result;
+}
+
+} // namespace straylight::snn
+```
+
+---
+
+### Task 4: Implement plasticity
+
+**Files:** `bin/snn/plasticity.h`, `bin/snn/plasticity.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/snn/plasticity.h
+#pragma once
+
+namespace straylight::snn {
+
+/// Parameters for spike-timing-dependent plasticity (STDP).
+struct STDPParams {
+    float a_plus = 0.01f;    // Max potentiation amplitude
+    float a_minus = 0.012f;  // Max depression amplitude
+    float tau_plus = 20.0f;  // Potentiation time constant (ms)
+    float tau_minus = 20.0f; // Depression time constant (ms)
+    float w_min = 0.0f;      // Minimum weight
+    float w_max = 1.0f;      // Maximum weight
+};
+
+/// STDP learning rule.
+/// If pre fires before post (dt > 0): potentiation → dw = a_plus * exp(-dt/tau_plus)
+/// If post fires before pre (dt < 0): depression → dw = -a_minus * exp(dt/tau_minus)
+class STDPRule {
+public:
+    explicit STDPRule(STDPParams params);
+
+    /// Compute weight change given pre and post spike times.
+    /// dt = t_post - t_pre (positive → potentiation, negative → depression)
+    [[nodiscard]] float compute_dw(float t_pre, float t_post) const;
+
+    /// Apply weight change with bounds enforcement.
+    [[nodiscard]] float apply(float current_weight, float dw) const;
+
+    [[nodiscard]] const STDPParams& params() const { return params_; }
+
+private:
+    STDPParams params_;
+};
+
+} // namespace straylight::snn
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/snn/plasticity.cpp
+#include "plasticity.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace straylight::snn {
+
+STDPRule::STDPRule(STDPParams params) : params_(params) {}
+
+float STDPRule::compute_dw(float t_pre, float t_post) const {
+    float dt = t_post - t_pre;
+
+    if (dt > 0.0f) {
+        // Pre before post → potentiation (Long-Term Potentiation)
+        return params_.a_plus * std::exp(-dt / params_.tau_plus);
+    } else if (dt < 0.0f) {
+        // Post before pre → depression (Long-Term Depression)
+        return -params_.a_minus * std::exp(dt / params_.tau_minus);
+    }
+    return 0.0f;  // Simultaneous → no change
+}
+
+float STDPRule::apply(float current_weight, float dw) const {
+    float new_weight = current_weight + dw;
+    return std::clamp(new_weight, params_.w_min, params_.w_max);
+}
+
+} // namespace straylight::snn
+```
+
+---
+
+### Task 5: Implement simulator
+
+**Files:** `bin/snn/simulator.h`, `bin/snn/simulator.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/snn/simulator.h
+#pragma once
+
+#include <straylight/result.h>
+#include "network.h"
+#include "plasticity.h"
+
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace straylight::snn {
+
+/// Spike event: (time_ms, neuron_id).
+using SpikeEvent = std::pair<float, NeuronId>;
+
+/// Discrete-time spiking neural network simulator.
+class Simulator {
+public:
+    /// Create a simulator for the given network with the specified timestep.
+    Simulator(SpikeNetwork& network, float dt);
+
+    /// Run the simulation for duration_ms milliseconds.
+    Result<void, std::string> run(float duration_ms);
+
+    /// Enable STDP learning.
+    void enable_stdp(const STDPRule& rule);
+
+    /// Get the spike log (all spikes recorded during simulation).
+    [[nodiscard]] const std::vector<SpikeEvent>& spike_log() const { return spike_log_; }
+
+    /// Current simulation time in ms.
+    [[nodiscard]] float current_time() const { return time_; }
+
+    /// Reset simulator state (but not network state).
+    void reset();
+
+private:
+    void step_once();
+    void deliver_spikes();
+    void apply_stdp();
+
+    SpikeNetwork& net_;
+    float dt_;
+    float time_ = 0.0f;
+
+    std::optional<STDPRule> stdp_;
+
+    // Spike log
+    std::vector<SpikeEvent> spike_log_;
+
+    // Pending spike deliveries: (delivery_time, post_neuron_id, weight)
+    struct PendingSpike {
+        float delivery_time;
+        NeuronId post;
+        float weight;
+    };
+    std::vector<PendingSpike> pending_spikes_;
+
+    // Per-neuron persistent injection currents
+    std::unordered_map<NeuronId, float> persistent_currents_;
+};
+
+} // namespace straylight::snn
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/snn/simulator.cpp
+#include "simulator.h"
+
+#include <algorithm>
+
+namespace straylight::snn {
+
+Simulator::Simulator(SpikeNetwork& network, float dt)
+    : net_(network), dt_(dt) {
+    // Capture any pre-set injection currents as persistent
+    for (auto id : net_.neuron_ids()) {
+        persistent_currents_[id] = 0.0f;
+    }
+}
+
+void Simulator::enable_stdp(const STDPRule& rule) {
+    stdp_ = rule;
+}
+
+Result<void, std::string> Simulator::run(float duration_ms) {
+    if (dt_ <= 0.0f) {
+        return Result<void, std::string>::error("timestep must be positive");
+    }
+
+    float end_time = time_ + duration_ms;
+    while (time_ < end_time) {
+        step_once();
+        time_ += dt_;
+    }
+    // Snap to exact end time
+    time_ = end_time;
+    return Result<void, std::string>::ok();
+}
+
+void Simulator::step_once() {
+    // 1. Deliver pending spikes that are due
+    deliver_spikes();
+
+    // 2. Re-inject persistent currents
+    for (auto& [id, current] : persistent_currents_) {
+        if (current != 0.0f) {
+            net_.neuron(id).inject_current(current);
+        }
+    }
+
+    // 3. Step all neurons
+    auto ids = net_.neuron_ids();
+    for (auto id : ids) {
+        auto& n = net_.neuron(id);
+        n.set_time(time_);
+        n.step(dt_);
+    }
+
+    // 4. Process spikes
+    for (auto id : ids) {
+        auto& n = net_.neuron(id);
+        if (n.has_spiked()) {
+            spike_log_.emplace_back(time_, id);
+
+            // Enqueue spike deliveries to post-synaptic neurons
+            for (const auto& syn : net_.outgoing_synapses(id)) {
+                pending_spikes_.push_back(PendingSpike{
+                    .delivery_time = time_ + syn.delay,
+                    .post = syn.post,
+                    .weight = syn.weight,
+                });
+            }
+
+            // Apply STDP if enabled
+            if (stdp_) apply_stdp();
+
+            n.clear_spike();
+        }
+    }
+}
+
+void Simulator::deliver_spikes() {
+    auto it = pending_spikes_.begin();
+    while (it != pending_spikes_.end()) {
+        if (it->delivery_time <= time_) {
+            net_.neuron(it->post).inject_current(it->weight);
+            it = pending_spikes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Simulator::apply_stdp() {
+    if (!stdp_) return;
+
+    // For each synapse, check if pre and post have recent spikes
+    auto synapses = net_.all_synapses();
+    for (auto* syn : synapses) {
+        float t_pre = net_.neuron(syn->pre).last_spike_time();
+        float t_post = net_.neuron(syn->post).last_spike_time();
+
+        // Only apply if both have spiked recently (within 2*tau window)
+        float max_tau = std::max(stdp_->params().tau_plus, stdp_->params().tau_minus);
+        if (t_pre < 0.0f || t_post < 0.0f) continue;
+        if (std::abs(t_post - t_pre) > 3.0f * max_tau) continue;
+
+        float dw = stdp_->compute_dw(t_pre, t_post);
+        syn->weight = stdp_->apply(syn->weight, dw);
+    }
+}
+
+void Simulator::reset() {
+    time_ = 0.0f;
+    spike_log_.clear();
+    pending_spikes_.clear();
+}
+
+} // namespace straylight::snn
+```
+
+---
+
+### Task 6: Implement snn main.cpp + CMakeLists.txt
+
+- [ ] **Step 1: Create `bin/snn/main.cpp`**
+
+```cpp
+// bin/snn/main.cpp
+// straylight-snn: on-demand spiking neural network simulator
+// Usage: straylight-snn --config <network.json> --duration <ms> [--output <spikes.csv>]
+
+#include <straylight/config.h>
+#include <straylight/log.h>
+
+#include "neuron.h"
+#include "network.h"
+#include "plasticity.h"
+#include "simulator.h"
+
+#include <nlohmann/json.hpp>
+
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <string>
+
+using namespace straylight;
+using namespace straylight::snn;
+
+static void print_usage() {
+    std::cerr << "Usage: straylight-snn [OPTIONS]\n"
+              << "  --config   <file>   Network configuration JSON\n"
+              << "  --duration <ms>     Simulation duration in milliseconds\n"
+              << "  --dt       <ms>     Timestep (default: 1.0)\n"
+              << "  --output   <file>   Output spike log CSV (default: stdout)\n"
+              << "  --stdp              Enable STDP learning\n"
+              << "  --help              Show this help\n";
+}
+
+int main(int argc, char* argv[]) {
+    SL_INIT("straylight-snn", "info");
+
+    std::string config_path;
+    std::string output_path;
+    float duration = 100.0f;
+    float dt = 1.0f;
+    bool enable_stdp = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) config_path = argv[++i];
+        else if (std::strcmp(argv[i], "--duration") == 0 && i + 1 < argc) duration = std::stof(argv[++i]);
+        else if (std::strcmp(argv[i], "--dt") == 0 && i + 1 < argc) dt = std::stof(argv[++i]);
+        else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) output_path = argv[++i];
+        else if (std::strcmp(argv[i], "--stdp") == 0) enable_stdp = true;
+        else if (std::strcmp(argv[i], "--help") == 0) { print_usage(); return 0; }
+    }
+
+    if (config_path.empty()) {
+        std::cerr << "error: --config required\n";
+        print_usage();
+        return 1;
+    }
+
+    // Load network configuration
+    std::ifstream f(config_path);
+    if (!f.is_open()) {
+        SL_ERROR("snn: cannot open {}", config_path);
+        return 1;
+    }
+
+    try {
+        auto j = nlohmann::json::parse(f);
+        SpikeNetwork net;
+
+        // Parse neurons
+        std::unordered_map<std::string, NeuronId> name_map;
+        for (const auto& nj : j["neurons"]) {
+            LIFParams p;
+            p.v_rest = nj.value("v_rest", -70.0f);
+            p.v_thresh = nj.value("v_thresh", -55.0f);
+            p.v_reset = nj.value("v_reset", -75.0f);
+            p.tau_m = nj.value("tau_m", 20.0f);
+            p.r_m = nj.value("r_m", 10.0f);
+            p.t_refract = nj.value("t_refract", 2.0f);
+
+            auto id = net.add_neuron(p);
+            std::string name = nj.value("name", std::to_string(id));
+            name_map[name] = id;
+
+            if (nj.contains("inject")) {
+                net.inject_current(id, nj["inject"].get<float>());
+            }
+        }
+
+        // Parse synapses
+        if (j.contains("synapses")) {
+            for (const auto& sj : j["synapses"]) {
+                std::string pre = sj["pre"].get<std::string>();
+                std::string post = sj["post"].get<std::string>();
+                float weight = sj.value("weight", 1.0f);
+                float delay = sj.value("delay", 1.0f);
+                net.connect(name_map.at(pre), name_map.at(post), weight, delay);
+            }
+        }
+
+        SL_INFO("snn: loaded {} neurons, {} synapses",
+                net.num_neurons(), net.num_synapses());
+
+        Simulator sim(net, dt);
+        if (enable_stdp) {
+            STDPParams sp;
+            if (j.contains("stdp")) {
+                sp.a_plus = j["stdp"].value("a_plus", 0.01f);
+                sp.a_minus = j["stdp"].value("a_minus", 0.012f);
+                sp.tau_plus = j["stdp"].value("tau_plus", 20.0f);
+                sp.tau_minus = j["stdp"].value("tau_minus", 20.0f);
+            }
+            sim.enable_stdp(STDPRule(sp));
+        }
+
+        auto r = sim.run(duration);
+        if (!r.has_value()) {
+            SL_ERROR("snn: simulation failed: {}", r.error());
+            return 1;
+        }
+
+        // Output spike log as CSV
+        auto& spikes = sim.spike_log();
+        std::ostream* out = &std::cout;
+        std::ofstream outfile;
+        if (!output_path.empty()) {
+            outfile.open(output_path);
+            out = &outfile;
+        }
+
+        *out << "time_ms,neuron_id\n";
+        for (const auto& [t, nid] : spikes) {
+            *out << t << "," << nid << "\n";
+        }
+
+        SL_INFO("snn: simulation complete, {} spikes in {}ms", spikes.size(), duration);
+
+    } catch (const nlohmann::json::exception& e) {
+        SL_ERROR("snn: JSON error: {}", e.what());
+        return 1;
+    }
+
+    return 0;
+}
+```
+
+- [ ] **Step 2: Create `bin/snn/CMakeLists.txt`**
+
+```cmake
+add_executable(straylight-snn
+    main.cpp
+    neuron.cpp
+    network.cpp
+    plasticity.cpp
+    simulator.cpp)
+target_link_libraries(straylight-snn PRIVATE straylight-common straylight-ml)
+target_include_directories(straylight-snn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+install(TARGETS straylight-snn DESTINATION bin)
+```
+
+- [ ] **Step 3: Add `add_subdirectory(bin/snn)` to root `CMakeLists.txt`**
+
+---
+
+### Task 7: Tests pass + commit
+
+- [ ] Run: `ctest --test-dir build -R test_snn` → all 11 pass
+- [ ] `git add bin/snn/ tests/unit/subsystems/test_snn.cpp`
+- [ ] `git commit -m "feat(snn): implement LIF neurons, STDP plasticity, and discrete-time simulator"`
+
+---
+
+## Chunk 7: straylight-rhem — Discovery, Allocator, Migration, Policy
+
+`bin/rhem/` — On-demand tool for runtime heterogeneous execution management. Discovers compute devices (CPUs, GPUs, FPGAs), allocates workloads to them, handles live migration of tensors between devices, and enforces scheduling policies. Links `libstraylight-common` + `libstraylight-ml` + `libstraylight-hw`.
+
+### File Structure
+
+```
+bin/rhem/
+├── CMakeLists.txt
+├── main.cpp
+├── discovery.h
+├── discovery.cpp
+├── allocator.h
+├── allocator.cpp
+├── migration.h
+├── migration.cpp
+├── policy.h
+└── policy.cpp
+tests/unit/subsystems/
+└── test_rhem.cpp
+```
+
+### Task 1: Failing tests
+
+**File:** `tests/unit/subsystems/test_rhem.cpp`
+
+- [ ] **Step 1: Write failing tests**
+
+```cpp
+// tests/unit/subsystems/test_rhem.cpp
+#include <gtest/gtest.h>
+#include "discovery.h"
+#include "allocator.h"
+#include "migration.h"
+#include "policy.h"
+
+using namespace straylight::rhem;
+
+// --- Discovery tests ---
+
+TEST(Discovery, RegisterAndEnumerate) {
+    DeviceRegistry reg;
+    DeviceInfo gpu0{.id = "gpu:0", .type = DeviceClass::GPU,
+                     .memory_bytes = 8ULL * 1024 * 1024 * 1024,
+                     .compute_units = 80, .vendor = "nvidia"};
+    DeviceInfo cpu0{.id = "cpu:0", .type = DeviceClass::CPU,
+                     .memory_bytes = 32ULL * 1024 * 1024 * 1024,
+                     .compute_units = 16, .vendor = "amd"};
+    reg.register_device(gpu0);
+    reg.register_device(cpu0);
+
+    EXPECT_EQ(reg.num_devices(), 2u);
+    auto gpus = reg.devices_by_type(DeviceClass::GPU);
+    EXPECT_EQ(gpus.size(), 1u);
+    EXPECT_EQ(gpus[0].id, "gpu:0");
+}
+
+TEST(Discovery, DeregisterDevice) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.deregister_device("gpu:0");
+    EXPECT_EQ(reg.num_devices(), 0u);
+}
+
+TEST(Discovery, UpdateDeviceStats) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.update_utilization("gpu:0", 0.75f, 6ULL << 30);
+
+    auto dev = reg.device("gpu:0");
+    ASSERT_TRUE(dev.has_value());
+    EXPECT_NEAR(dev->utilization, 0.75f, 0.01f);
+    EXPECT_EQ(dev->memory_used, 6ULL << 30);
+}
+
+// --- Allocator tests ---
+
+TEST(Allocator, AllocateToBestDevice) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.register_device(DeviceInfo{.id = "gpu:1", .type = DeviceClass::GPU,
+                                     .memory_bytes = 16ULL << 30, .compute_units = 80});
+
+    DeviceAllocator alloc(reg);
+    AllocationRequest req{.workload_id = "task_1", .memory_needed = 10ULL << 30,
+                           .preferred_type = DeviceClass::GPU};
+
+    auto r = alloc.allocate(req);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r.value().device_id, "gpu:1");  // Only gpu:1 has enough memory
+}
+
+TEST(Allocator, AllocationFailsInsufficientMemory) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 4ULL << 30, .compute_units = 80});
+
+    DeviceAllocator alloc(reg);
+    AllocationRequest req{.workload_id = "task_1", .memory_needed = 8ULL << 30,
+                           .preferred_type = DeviceClass::GPU};
+
+    auto r = alloc.allocate(req);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(Allocator, ReleaseFreesMemory) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+
+    DeviceAllocator alloc(reg);
+    AllocationRequest req{.workload_id = "t1", .memory_needed = 6ULL << 30,
+                           .preferred_type = DeviceClass::GPU};
+    auto r = alloc.allocate(req);
+    ASSERT_TRUE(r.has_value());
+
+    alloc.release("t1");
+
+    // Now should be able to allocate again
+    req.workload_id = "t2";
+    auto r2 = alloc.allocate(req);
+    EXPECT_TRUE(r2.has_value());
+}
+
+// --- Migration tests ---
+
+TEST(Migration, PlanMigration) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.register_device(DeviceInfo{.id = "gpu:1", .type = DeviceClass::GPU,
+                                     .memory_bytes = 16ULL << 30, .compute_units = 80});
+
+    MigrationPlanner planner(reg);
+    MigrationRequest req{.tensor_id = "model.layer1.weight",
+                          .source_device = "gpu:0",
+                          .target_device = "gpu:1",
+                          .tensor_bytes = 1ULL << 30};
+
+    auto plan = planner.plan(req);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan.value().source, "gpu:0");
+    EXPECT_EQ(plan.value().target, "gpu:1");
+    EXPECT_GT(plan.value().estimated_time_ms, 0.0f);
+}
+
+TEST(Migration, RejectMigrationInsufficientTarget) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.register_device(DeviceInfo{.id = "gpu:1", .type = DeviceClass::GPU,
+                                     .memory_bytes = 1ULL << 30, .compute_units = 40});
+
+    MigrationPlanner planner(reg);
+    MigrationRequest req{.tensor_id = "big_tensor",
+                          .source_device = "gpu:0",
+                          .target_device = "gpu:1",
+                          .tensor_bytes = 4ULL << 30};
+
+    auto plan = planner.plan(req);
+    EXPECT_FALSE(plan.has_value());
+}
+
+// --- Policy tests ---
+
+TEST(Policy, MemoryPressureTriggersEviction) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.update_utilization("gpu:0", 0.5f, 7ULL << 30);  // 87.5% memory used
+
+    SchedulingPolicy policy(reg);
+    policy.set_memory_threshold(0.85f);  // Trigger at 85%
+
+    auto actions = policy.evaluate();
+    EXPECT_FALSE(actions.empty());
+    // Should recommend eviction from gpu:0
+    bool found_evict = false;
+    for (const auto& a : actions) {
+        if (a.type == PolicyAction::Type::Evict && a.device_id == "gpu:0") {
+            found_evict = true;
+        }
+    }
+    EXPECT_TRUE(found_evict);
+}
+
+TEST(Policy, NoActionWhenHealthy) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.update_utilization("gpu:0", 0.3f, 2ULL << 30);  // 25% memory, low util
+
+    SchedulingPolicy policy(reg);
+    policy.set_memory_threshold(0.85f);
+
+    auto actions = policy.evaluate();
+    EXPECT_TRUE(actions.empty());
+}
+
+TEST(Policy, LoadBalanceAcrossDevices) {
+    DeviceRegistry reg;
+    reg.register_device(DeviceInfo{.id = "gpu:0", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.register_device(DeviceInfo{.id = "gpu:1", .type = DeviceClass::GPU,
+                                     .memory_bytes = 8ULL << 30, .compute_units = 80});
+    reg.update_utilization("gpu:0", 0.95f, 6ULL << 30);  // Overloaded
+    reg.update_utilization("gpu:1", 0.1f, 1ULL << 30);   // Idle
+
+    SchedulingPolicy policy(reg);
+    policy.set_utilization_threshold(0.9f);
+
+    auto actions = policy.evaluate();
+    bool found_migrate = false;
+    for (const auto& a : actions) {
+        if (a.type == PolicyAction::Type::Migrate) {
+            found_migrate = true;
+        }
+    }
+    EXPECT_TRUE(found_migrate);
+}
+```
+
+- [ ] **Step 2: Add to `tests/unit/subsystems/CMakeLists.txt`**
+
+```cmake
+add_executable(test_rhem test_rhem.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/discovery.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/allocator.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/migration.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/policy.cpp)
+target_include_directories(test_rhem PRIVATE ${PROJECT_SOURCE_DIR}/bin/rhem)
+target_link_libraries(test_rhem PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_rhem)
+```
+
+Run: expect 11 failures.
+
+---
+
+### Task 2: Implement discovery
+
+**Files:** `bin/rhem/discovery.h`, `bin/rhem/discovery.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/rhem/discovery.h
+#pragma once
+
+#include <straylight/result.h>
+
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace straylight::rhem {
+
+enum class DeviceClass : uint8_t {
+    CPU = 0,
+    GPU = 1,
+    FPGA = 2,
+    TPU = 3,
+};
+
+struct DeviceInfo {
+    std::string id;
+    DeviceClass type = DeviceClass::CPU;
+    uint64_t memory_bytes = 0;
+    uint32_t compute_units = 0;
+    std::string vendor;
+
+    // Runtime stats (updated periodically)
+    float utilization = 0.0f;      // 0.0 to 1.0
+    uint64_t memory_used = 0;
+    float temperature_c = 0.0f;
+    float bandwidth_gbps = 0.0f;   // PCIe/interconnect bandwidth
+};
+
+/// Device registry: tracks available compute devices and their runtime stats.
+class DeviceRegistry {
+public:
+    void register_device(DeviceInfo info);
+    void deregister_device(const std::string& id);
+
+    [[nodiscard]] std::optional<DeviceInfo> device(const std::string& id) const;
+    [[nodiscard]] std::vector<DeviceInfo> devices_by_type(DeviceClass type) const;
+    [[nodiscard]] std::vector<DeviceInfo> all_devices() const;
+    [[nodiscard]] size_t num_devices() const;
+
+    void update_utilization(const std::string& id, float util, uint64_t mem_used);
+    void update_temperature(const std::string& id, float temp_c);
+
+    /// Probe system for available devices (reads /proc, sysfs).
+    Result<void, std::string> auto_discover();
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, DeviceInfo> devices_;
+};
+
+} // namespace straylight::rhem
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/rhem/discovery.cpp
+#include "discovery.h"
+
+#include <algorithm>
+#include <fstream>
+#include <filesystem>
+
+namespace straylight::rhem {
+
+void DeviceRegistry::register_device(DeviceInfo info) {
+    std::lock_guard lock(mu_);
+    devices_[info.id] = std::move(info);
+}
+
+void DeviceRegistry::deregister_device(const std::string& id) {
+    std::lock_guard lock(mu_);
+    devices_.erase(id);
+}
+
+std::optional<DeviceInfo> DeviceRegistry::device(const std::string& id) const {
+    std::lock_guard lock(mu_);
+    auto it = devices_.find(id);
+    if (it == devices_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::vector<DeviceInfo> DeviceRegistry::devices_by_type(DeviceClass type) const {
+    std::lock_guard lock(mu_);
+    std::vector<DeviceInfo> result;
+    for (const auto& [id, dev] : devices_) {
+        if (dev.type == type) result.push_back(dev);
+    }
+    return result;
+}
+
+std::vector<DeviceInfo> DeviceRegistry::all_devices() const {
+    std::lock_guard lock(mu_);
+    std::vector<DeviceInfo> result;
+    result.reserve(devices_.size());
+    for (const auto& [id, dev] : devices_) result.push_back(dev);
+    return result;
+}
+
+size_t DeviceRegistry::num_devices() const {
+    std::lock_guard lock(mu_);
+    return devices_.size();
+}
+
+void DeviceRegistry::update_utilization(const std::string& id, float util, uint64_t mem_used) {
+    std::lock_guard lock(mu_);
+    auto it = devices_.find(id);
+    if (it != devices_.end()) {
+        it->second.utilization = util;
+        it->second.memory_used = mem_used;
+    }
+}
+
+void DeviceRegistry::update_temperature(const std::string& id, float temp_c) {
+    std::lock_guard lock(mu_);
+    auto it = devices_.find(id);
+    if (it != devices_.end()) {
+        it->second.temperature_c = temp_c;
+    }
+}
+
+Result<void, std::string> DeviceRegistry::auto_discover() {
+    // Discover CPUs from /proc/cpuinfo
+    {
+        std::ifstream f("/proc/cpuinfo");
+        if (f.is_open()) {
+            int core_count = 0;
+            std::string line;
+            while (std::getline(f, line)) {
+                if (line.find("processor") == 0) core_count++;
+            }
+            if (core_count > 0) {
+                // Get memory from /proc/meminfo
+                uint64_t mem_bytes = 0;
+                std::ifstream memf("/proc/meminfo");
+                if (memf.is_open()) {
+                    std::string key;
+                    uint64_t val;
+                    std::string unit;
+                    while (memf >> key >> val) {
+                        if (key == "MemTotal:") {
+                            memf >> unit;
+                            mem_bytes = val * 1024;
+                            break;
+                        }
+                    }
+                }
+
+                register_device(DeviceInfo{
+                    .id = "cpu:0",
+                    .type = DeviceClass::CPU,
+                    .memory_bytes = mem_bytes,
+                    .compute_units = static_cast<uint32_t>(core_count),
+                    .vendor = "system",
+                });
+            }
+        }
+    }
+
+    // Discover NVIDIA GPUs from sysfs
+    std::string gpu_base = "/proc/driver/nvidia/gpus";
+    if (std::filesystem::exists(gpu_base)) {
+        int gpu_idx = 0;
+        for (auto& entry : std::filesystem::directory_iterator(gpu_base)) {
+            if (entry.is_directory()) {
+                std::string gpu_id = "gpu:" + std::to_string(gpu_idx);
+                register_device(DeviceInfo{
+                    .id = gpu_id,
+                    .type = DeviceClass::GPU,
+                    .memory_bytes = 0,  // Would need nvidia-smi or NVML for this
+                    .compute_units = 0,
+                    .vendor = "nvidia",
+                });
+                gpu_idx++;
+            }
+        }
+    }
+
+    // Discover AMD GPUs via /sys/class/drm
+    std::string drm_base = "/sys/class/drm";
+    if (std::filesystem::exists(drm_base)) {
+        int amd_idx = 0;
+        for (auto& entry : std::filesystem::directory_iterator(drm_base)) {
+            auto name = entry.path().filename().string();
+            if (name.find("card") == 0 && name.find("-") == std::string::npos) {
+                auto vendor_path = entry.path() / "device" / "vendor";
+                if (std::filesystem::exists(vendor_path)) {
+                    std::ifstream vf(vendor_path);
+                    std::string vendor_id;
+                    vf >> vendor_id;
+                    if (vendor_id == "0x1002") {  // AMD vendor ID
+                        register_device(DeviceInfo{
+                            .id = "gpu:" + std::to_string(amd_idx),
+                            .type = DeviceClass::GPU,
+                            .vendor = "amd",
+                        });
+                        amd_idx++;
+                    }
+                }
+            }
+        }
+    }
+
+    return Result<void, std::string>::ok();
+}
+
+} // namespace straylight::rhem
+```
+
+---
+
+### Task 3: Implement allocator
+
+**Files:** `bin/rhem/allocator.h`, `bin/rhem/allocator.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/rhem/allocator.h
+#pragma once
+
+#include <straylight/result.h>
+#include "discovery.h"
+
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+namespace straylight::rhem {
+
+struct AllocationRequest {
+    std::string workload_id;
+    uint64_t memory_needed = 0;
+    DeviceClass preferred_type = DeviceClass::GPU;
+    uint32_t min_compute_units = 0;
+};
+
+struct AllocationResult {
+    std::string device_id;
+    uint64_t memory_allocated;
+};
+
+/// Workload-to-device allocator using first-fit-decreasing strategy.
+class DeviceAllocator {
+public:
+    explicit DeviceAllocator(DeviceRegistry& registry);
+
+    /// Allocate a device for the given workload.
+    Result<AllocationResult, std::string> allocate(const AllocationRequest& req);
+
+    /// Release a previously allocated workload.
+    void release(const std::string& workload_id);
+
+    /// Get current allocations.
+    [[nodiscard]] std::unordered_map<std::string, AllocationResult> allocations() const;
+
+private:
+    DeviceRegistry& registry_;
+    mutable std::mutex mu_;
+    // workload_id → allocation
+    std::unordered_map<std::string, AllocationResult> allocations_;
+    // device_id → total memory committed to workloads
+    std::unordered_map<std::string, uint64_t> committed_memory_;
+};
+
+} // namespace straylight::rhem
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/rhem/allocator.cpp
+#include "allocator.h"
+
+#include <algorithm>
+
+namespace straylight::rhem {
+
+DeviceAllocator::DeviceAllocator(DeviceRegistry& registry)
+    : registry_(registry) {}
+
+Result<AllocationResult, std::string> DeviceAllocator::allocate(
+        const AllocationRequest& req) {
+    std::lock_guard lock(mu_);
+
+    auto devices = registry_.devices_by_type(req.preferred_type);
+    if (devices.empty()) {
+        // Fall back to any device
+        devices = registry_.all_devices();
+    }
+
+    // Sort by available memory (descending) — best fit
+    std::sort(devices.begin(), devices.end(),
+        [this](const DeviceInfo& a, const DeviceInfo& b) {
+            uint64_t a_committed = 0, b_committed = 0;
+            if (committed_memory_.contains(a.id)) a_committed = committed_memory_.at(a.id);
+            if (committed_memory_.contains(b.id)) b_committed = committed_memory_.at(b.id);
+            uint64_t a_avail = a.memory_bytes > a_committed ? a.memory_bytes - a_committed : 0;
+            uint64_t b_avail = b.memory_bytes > b_committed ? b.memory_bytes - b_committed : 0;
+            return a_avail > b_avail;
+        });
+
+    for (const auto& dev : devices) {
+        if (req.min_compute_units > 0 && dev.compute_units < req.min_compute_units) continue;
+
+        uint64_t committed = 0;
+        if (committed_memory_.contains(dev.id)) committed = committed_memory_[dev.id];
+        uint64_t available = (dev.memory_bytes > committed) ? dev.memory_bytes - committed : 0;
+
+        if (available >= req.memory_needed) {
+            committed_memory_[dev.id] = committed + req.memory_needed;
+            AllocationResult result{dev.id, req.memory_needed};
+            allocations_[req.workload_id] = result;
+            return Result<AllocationResult, std::string>::ok(result);
+        }
+    }
+
+    return Result<AllocationResult, std::string>::error(
+        "no device with sufficient memory for workload " + req.workload_id +
+        " (need " + std::to_string(req.memory_needed) + " bytes)");
+}
+
+void DeviceAllocator::release(const std::string& workload_id) {
+    std::lock_guard lock(mu_);
+    auto it = allocations_.find(workload_id);
+    if (it != allocations_.end()) {
+        auto& alloc = it->second;
+        if (committed_memory_.contains(alloc.device_id)) {
+            auto& committed = committed_memory_[alloc.device_id];
+            committed = (committed > alloc.memory_allocated)
+                ? committed - alloc.memory_allocated : 0;
+        }
+        allocations_.erase(it);
+    }
+}
+
+std::unordered_map<std::string, AllocationResult> DeviceAllocator::allocations() const {
+    std::lock_guard lock(mu_);
+    return allocations_;
+}
+
+} // namespace straylight::rhem
+```
+
+---
+
+### Task 4: Implement migration
+
+**Files:** `bin/rhem/migration.h`, `bin/rhem/migration.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/rhem/migration.h
+#pragma once
+
+#include <straylight/result.h>
+#include "discovery.h"
+
+#include <string>
+
+namespace straylight::rhem {
+
+struct MigrationRequest {
+    std::string tensor_id;
+    std::string source_device;
+    std::string target_device;
+    uint64_t tensor_bytes;
+};
+
+struct MigrationPlan {
+    std::string tensor_id;
+    std::string source;
+    std::string target;
+    uint64_t bytes;
+    float estimated_time_ms;    // Based on interconnect bandwidth
+    bool requires_format_conversion;  // CPU↔GPU needs conversion
+};
+
+/// Plans tensor migrations between devices.
+class MigrationPlanner {
+public:
+    explicit MigrationPlanner(const DeviceRegistry& registry);
+
+    /// Create a migration plan. Validates source/target exist and target has capacity.
+    Result<MigrationPlan, std::string> plan(const MigrationRequest& req) const;
+
+    /// Estimate transfer time based on device interconnect bandwidth.
+    [[nodiscard]] float estimate_transfer_time(
+        const std::string& source, const std::string& target,
+        uint64_t bytes) const;
+
+private:
+    const DeviceRegistry& registry_;
+};
+
+} // namespace straylight::rhem
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/rhem/migration.cpp
+#include "migration.h"
+
+namespace straylight::rhem {
+
+MigrationPlanner::MigrationPlanner(const DeviceRegistry& registry)
+    : registry_(registry) {}
+
+Result<MigrationPlan, std::string> MigrationPlanner::plan(
+        const MigrationRequest& req) const {
+    auto src = registry_.device(req.source_device);
+    if (!src.has_value()) {
+        return Result<MigrationPlan, std::string>::error(
+            "source device not found: " + req.source_device);
+    }
+
+    auto tgt = registry_.device(req.target_device);
+    if (!tgt.has_value()) {
+        return Result<MigrationPlan, std::string>::error(
+            "target device not found: " + req.target_device);
+    }
+
+    // Check target has enough free memory
+    uint64_t tgt_free = tgt->memory_bytes > tgt->memory_used
+        ? tgt->memory_bytes - tgt->memory_used : 0;
+    if (tgt_free < req.tensor_bytes) {
+        return Result<MigrationPlan, std::string>::error(
+            "target device " + req.target_device +
+            " has insufficient memory: " + std::to_string(tgt_free) +
+            " free, need " + std::to_string(req.tensor_bytes));
+    }
+
+    float time_ms = estimate_transfer_time(req.source_device, req.target_device,
+                                            req.tensor_bytes);
+
+    bool needs_conversion = (src->type != tgt->type);
+
+    return Result<MigrationPlan, std::string>::ok(MigrationPlan{
+        .tensor_id = req.tensor_id,
+        .source = req.source_device,
+        .target = req.target_device,
+        .bytes = req.tensor_bytes,
+        .estimated_time_ms = time_ms,
+        .requires_format_conversion = needs_conversion,
+    });
+}
+
+float MigrationPlanner::estimate_transfer_time(
+        const std::string& source, const std::string& target,
+        uint64_t bytes) const {
+    // Estimate based on interconnect bandwidth
+    auto src = registry_.device(source);
+    auto tgt = registry_.device(target);
+
+    float bandwidth_gbps = 16.0f;  // Default PCIe Gen4 x16
+
+    if (src.has_value() && src->bandwidth_gbps > 0.0f) {
+        bandwidth_gbps = src->bandwidth_gbps;
+    }
+    if (tgt.has_value() && tgt->bandwidth_gbps > 0.0f) {
+        bandwidth_gbps = std::min(bandwidth_gbps, tgt->bandwidth_gbps);
+    }
+
+    // Same device type peer-to-peer may use NVLink (faster)
+    if (src.has_value() && tgt.has_value() &&
+        src->type == DeviceClass::GPU && tgt->type == DeviceClass::GPU &&
+        src->vendor == tgt->vendor) {
+        bandwidth_gbps *= 2.0f;  // Approximate NVLink advantage
+    }
+
+    // Convert: bytes / (Gbps * 1e9 / 8) * 1000 ms
+    float bandwidth_bytes_per_ms = (bandwidth_gbps * 1e9f / 8.0f) / 1000.0f;
+    if (bandwidth_bytes_per_ms <= 0.0f) bandwidth_bytes_per_ms = 1e6f;
+
+    return static_cast<float>(bytes) / bandwidth_bytes_per_ms;
+}
+
+} // namespace straylight::rhem
+```
+
+---
+
+### Task 5: Implement policy
+
+**Files:** `bin/rhem/policy.h`, `bin/rhem/policy.cpp`
+
+- [ ] **Step 1: Header**
+
+```cpp
+// bin/rhem/policy.h
+#pragma once
+
+#include "discovery.h"
+
+#include <string>
+#include <vector>
+
+namespace straylight::rhem {
+
+struct PolicyAction {
+    enum class Type : uint8_t {
+        NoOp = 0,
+        Evict = 1,      // Evict least-recently-used tensors from device
+        Migrate = 2,    // Migrate workload to less-loaded device
+        Throttle = 3,   // Reduce new allocations on overloaded device
+        Rebalance = 4,  // General rebalancing across devices
+    };
+
+    Type type = Type::NoOp;
+    std::string device_id;
+    std::string target_device_id;  // For Migrate actions
+    std::string reason;
+};
+
+/// Scheduling policy engine that evaluates device health
+/// and recommends corrective actions.
+class SchedulingPolicy {
+public:
+    explicit SchedulingPolicy(const DeviceRegistry& registry);
+
+    /// Set memory utilization threshold (0.0-1.0). Default 0.85.
+    void set_memory_threshold(float threshold);
+
+    /// Set compute utilization threshold (0.0-1.0). Default 0.90.
+    void set_utilization_threshold(float threshold);
+
+    /// Set thermal throttle temperature (Celsius). Default 85.
+    void set_thermal_limit(float temp_c);
+
+    /// Evaluate all devices and return recommended actions.
+    [[nodiscard]] std::vector<PolicyAction> evaluate() const;
+
+private:
+    const DeviceRegistry& registry_;
+    float memory_threshold_ = 0.85f;
+    float utilization_threshold_ = 0.90f;
+    float thermal_limit_ = 85.0f;
+
+    std::vector<PolicyAction> check_memory_pressure() const;
+    std::vector<PolicyAction> check_compute_balance() const;
+    std::vector<PolicyAction> check_thermal() const;
+};
+
+} // namespace straylight::rhem
+```
+
+- [ ] **Step 2: Implementation**
+
+```cpp
+// bin/rhem/policy.cpp
+#include "policy.h"
+
+#include <algorithm>
+
+namespace straylight::rhem {
+
+SchedulingPolicy::SchedulingPolicy(const DeviceRegistry& registry)
+    : registry_(registry) {}
+
+void SchedulingPolicy::set_memory_threshold(float threshold) {
+    memory_threshold_ = threshold;
+}
+
+void SchedulingPolicy::set_utilization_threshold(float threshold) {
+    utilization_threshold_ = threshold;
+}
+
+void SchedulingPolicy::set_thermal_limit(float temp_c) {
+    thermal_limit_ = temp_c;
+}
+
+std::vector<PolicyAction> SchedulingPolicy::evaluate() const {
+    std::vector<PolicyAction> actions;
+
+    auto mem_actions = check_memory_pressure();
+    actions.insert(actions.end(), mem_actions.begin(), mem_actions.end());
+
+    auto compute_actions = check_compute_balance();
+    actions.insert(actions.end(), compute_actions.begin(), compute_actions.end());
+
+    auto thermal_actions = check_thermal();
+    actions.insert(actions.end(), thermal_actions.begin(), thermal_actions.end());
+
+    return actions;
+}
+
+std::vector<PolicyAction> SchedulingPolicy::check_memory_pressure() const {
+    std::vector<PolicyAction> actions;
+    auto devices = registry_.all_devices();
+
+    for (const auto& dev : devices) {
+        if (dev.memory_bytes == 0) continue;
+        float mem_ratio = static_cast<float>(dev.memory_used) /
+                         static_cast<float>(dev.memory_bytes);
+        if (mem_ratio > memory_threshold_) {
+            actions.push_back(PolicyAction{
+                .type = PolicyAction::Type::Evict,
+                .device_id = dev.id,
+                .reason = "memory pressure: " +
+                    std::to_string(static_cast<int>(mem_ratio * 100)) +
+                    "% used (threshold: " +
+                    std::to_string(static_cast<int>(memory_threshold_ * 100)) + "%)",
+            });
+        }
+    }
+    return actions;
+}
+
+std::vector<PolicyAction> SchedulingPolicy::check_compute_balance() const {
+    std::vector<PolicyAction> actions;
+    auto devices = registry_.all_devices();
+
+    // Find overloaded and underloaded devices of the same type
+    struct DevUtil {
+        std::string id;
+        DeviceClass type;
+        float util;
+    };
+    std::vector<DevUtil> utils;
+    for (const auto& dev : devices) {
+        utils.push_back({dev.id, dev.type, dev.utilization});
+    }
+
+    for (const auto& hot : utils) {
+        if (hot.util < utilization_threshold_) continue;
+
+        // Find a cold device of the same type
+        for (const auto& cold : utils) {
+            if (cold.id == hot.id) continue;
+            if (cold.type != hot.type) continue;
+            if (cold.util > 0.5f) continue;  // Not idle enough
+
+            actions.push_back(PolicyAction{
+                .type = PolicyAction::Type::Migrate,
+                .device_id = hot.id,
+                .target_device_id = cold.id,
+                .reason = "load imbalance: " + hot.id + " at " +
+                    std::to_string(static_cast<int>(hot.util * 100)) +
+                    "%, " + cold.id + " at " +
+                    std::to_string(static_cast<int>(cold.util * 100)) + "%",
+            });
+            break;  // One migration suggestion per hot device
+        }
+    }
+    return actions;
+}
+
+std::vector<PolicyAction> SchedulingPolicy::check_thermal() const {
+    std::vector<PolicyAction> actions;
+    auto devices = registry_.all_devices();
+
+    for (const auto& dev : devices) {
+        if (dev.temperature_c > thermal_limit_) {
+            actions.push_back(PolicyAction{
+                .type = PolicyAction::Type::Throttle,
+                .device_id = dev.id,
+                .reason = "thermal: " + std::to_string(static_cast<int>(dev.temperature_c)) +
+                    "C exceeds limit of " + std::to_string(static_cast<int>(thermal_limit_)) + "C",
+            });
+        }
+    }
+    return actions;
+}
+
+} // namespace straylight::rhem
+```
+
+---
+
+### Task 6: Implement rhem main.cpp + CMakeLists.txt
+
+- [ ] **Step 1: Create `bin/rhem/main.cpp`**
+
+```cpp
+// bin/rhem/main.cpp
+// straylight-rhem: on-demand heterogeneous execution manager
+// Usage: straylight-rhem <command> [options]
+// Commands: discover, allocate, migrate, policy
+
+#include <straylight/config.h>
+#include <straylight/log.h>
+
+#include "discovery.h"
+#include "allocator.h"
+#include "migration.h"
+#include "policy.h"
+
+#include <nlohmann/json.hpp>
+
+#include <cstring>
+#include <iostream>
+#include <string>
+
+using namespace straylight;
+using namespace straylight::rhem;
+
+static void print_usage() {
+    std::cerr << "Usage: straylight-rhem <command> [options]\n"
+              << "Commands:\n"
+              << "  discover           Probe system for compute devices\n"
+              << "  allocate           Allocate a workload to a device\n"
+              << "    --workload <id>  Workload identifier\n"
+              << "    --memory <bytes> Memory requirement\n"
+              << "    --type <gpu|cpu> Preferred device type\n"
+              << "  migrate            Plan a tensor migration\n"
+              << "    --tensor <id>    Tensor identifier\n"
+              << "    --from <device>  Source device\n"
+              << "    --to <device>    Target device\n"
+              << "    --bytes <n>      Tensor size in bytes\n"
+              << "  policy             Evaluate scheduling policy\n"
+              << "  status             Show device status\n";
+}
+
+int main(int argc, char* argv[]) {
+    SL_INIT("straylight-rhem", "info");
+
+    if (argc < 2) {
+        print_usage();
+        return 1;
+    }
+
+    std::string command = argv[1];
+    DeviceRegistry registry;
+
+    if (command == "discover") {
+        auto r = registry.auto_discover();
+        if (!r.has_value()) {
+            SL_ERROR("rhem: discovery failed: {}", r.error());
+            return 1;
+        }
+
+        auto devices = registry.all_devices();
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& dev : devices) {
+            out.push_back({
+                {"id", dev.id},
+                {"type", static_cast<int>(dev.type)},
+                {"memory_bytes", dev.memory_bytes},
+                {"compute_units", dev.compute_units},
+                {"vendor", dev.vendor},
+            });
+        }
+        std::cout << out.dump(2) << "\n";
+        SL_INFO("rhem: discovered {} devices", devices.size());
+    } else if (command == "allocate") {
+        registry.auto_discover();
+        std::string workload;
+        uint64_t memory = 0;
+        std::string type_str = "gpu";
+
+        for (int i = 2; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--workload") == 0 && i + 1 < argc) workload = argv[++i];
+            else if (std::strcmp(argv[i], "--memory") == 0 && i + 1 < argc) memory = std::stoull(argv[++i]);
+            else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) type_str = argv[++i];
+        }
+
+        DeviceClass pref = (type_str == "cpu") ? DeviceClass::CPU : DeviceClass::GPU;
+        DeviceAllocator alloc(registry);
+        auto r = alloc.allocate(AllocationRequest{workload, memory, pref});
+        if (!r.has_value()) {
+            SL_ERROR("rhem: {}", r.error());
+            return 1;
+        }
+        std::cout << nlohmann::json({{"device", r.value().device_id},
+                                       {"memory_allocated", r.value().memory_allocated}}).dump(2) << "\n";
+    } else if (command == "migrate") {
+        registry.auto_discover();
+        std::string tensor, from, to;
+        uint64_t bytes = 0;
+
+        for (int i = 2; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--tensor") == 0 && i + 1 < argc) tensor = argv[++i];
+            else if (std::strcmp(argv[i], "--from") == 0 && i + 1 < argc) from = argv[++i];
+            else if (std::strcmp(argv[i], "--to") == 0 && i + 1 < argc) to = argv[++i];
+            else if (std::strcmp(argv[i], "--bytes") == 0 && i + 1 < argc) bytes = std::stoull(argv[++i]);
+        }
+
+        MigrationPlanner planner(registry);
+        auto r = planner.plan(MigrationRequest{tensor, from, to, bytes});
+        if (!r.has_value()) {
+            SL_ERROR("rhem: {}", r.error());
+            return 1;
+        }
+        auto& plan = r.value();
+        std::cout << nlohmann::json({
+            {"tensor", plan.tensor_id}, {"source", plan.source},
+            {"target", plan.target}, {"bytes", plan.bytes},
+            {"estimated_ms", plan.estimated_time_ms},
+            {"needs_conversion", plan.requires_format_conversion},
+        }).dump(2) << "\n";
+    } else if (command == "policy") {
+        registry.auto_discover();
+        SchedulingPolicy policy(registry);
+        auto actions = policy.evaluate();
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& a : actions) {
+            out.push_back({{"type", static_cast<int>(a.type)},
+                            {"device", a.device_id},
+                            {"target", a.target_device_id},
+                            {"reason", a.reason}});
+        }
+        std::cout << out.dump(2) << "\n";
+    } else if (command == "--help" || command == "help") {
+        print_usage();
+    } else {
+        std::cerr << "error: unknown command: " << command << "\n";
+        print_usage();
+        return 1;
+    }
+
+    return 0;
+}
+```
+
+- [ ] **Step 2: Create `bin/rhem/CMakeLists.txt`**
+
+```cmake
+add_executable(straylight-rhem
+    main.cpp
+    discovery.cpp
+    allocator.cpp
+    migration.cpp
+    policy.cpp)
+target_link_libraries(straylight-rhem PRIVATE straylight-common straylight-ml straylight-hw)
+target_include_directories(straylight-rhem PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+install(TARGETS straylight-rhem DESTINATION bin)
+```
+
+- [ ] **Step 3: Add `add_subdirectory(bin/rhem)` to root `CMakeLists.txt`**
+
+---
+
+### Task 7: Tests pass + commit
+
+- [ ] Run: `ctest --test-dir build -R test_rhem` → all 11 pass
+- [ ] `git add bin/rhem/ tests/unit/subsystems/test_rhem.cpp`
+- [ ] `git commit -m "feat(rhem): implement device discovery, allocation, migration, and scheduling policy"`
+
+---
+
+## Chunk 8: Tests + CMake Integration for All 5 Subsystems
+
+Final integration chunk: ensures all test targets compile together, adds subsystem subdirectories to root CMake, and runs the full test suite.
+
+### Task 1: Update root CMakeLists.txt
+
+- [ ] **Step 1: Add subsystem subdirectories to `CMakeLists.txt`**
+
+Add the following lines to the `# Subsystem binaries` section:
+
+```cmake
+# ML subsystem binaries (Plan 5)
+add_subdirectory(bin/agent)
+add_subdirectory(bin/compiler)
+add_subdirectory(bin/morph)
+add_subdirectory(bin/snn)
+add_subdirectory(bin/rhem)
+```
+
+---
+
+### Task 2: Update tests/unit/subsystems/CMakeLists.txt
+
+- [ ] **Step 1: Add all Plan 5 test targets** (gathered from chunks 1-7)
+
+```cmake
+# --- Plan 5: ML Subsystem tests ---
+
+# straylight-agent tests
+add_executable(test_agent_queue test_agent_queue.cpp
+    ${PROJECT_SOURCE_DIR}/bin/agent/task_queue.cpp)
+target_include_directories(test_agent_queue PRIVATE ${PROJECT_SOURCE_DIR}/bin/agent)
+target_link_libraries(test_agent_queue PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_agent_queue)
+
+add_executable(test_agent_worker test_agent_worker.cpp
+    ${PROJECT_SOURCE_DIR}/bin/agent/worker_pool.cpp
+    ${PROJECT_SOURCE_DIR}/bin/agent/task_queue.cpp)
+target_include_directories(test_agent_worker PRIVATE ${PROJECT_SOURCE_DIR}/bin/agent)
+target_link_libraries(test_agent_worker PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_agent_worker)
+
+add_executable(test_agent_distribution test_agent_distribution.cpp
+    ${PROJECT_SOURCE_DIR}/bin/agent/distribution.cpp)
+target_include_directories(test_agent_distribution PRIVATE ${PROJECT_SOURCE_DIR}/bin/agent)
+target_link_libraries(test_agent_distribution PRIVATE straylight-common GTest::gtest_main)
+gtest_discover_tests(test_agent_distribution)
+
+# straylight-compiler tests
+add_executable(test_compiler_ir test_compiler_ir.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/ir/graph.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/ir/passes.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/ir/lowering.cpp)
+target_include_directories(test_compiler_ir PRIVATE ${PROJECT_SOURCE_DIR}/bin/compiler)
+target_link_libraries(test_compiler_ir PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_compiler_ir)
+
+add_executable(test_compiler_backends test_compiler_backends.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/ir/graph.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/ir/passes.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/ir/lowering.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/backends/cpu.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/backends/cuda.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/backends/rocm.cpp
+    ${PROJECT_SOURCE_DIR}/bin/compiler/cache.cpp)
+target_include_directories(test_compiler_backends PRIVATE ${PROJECT_SOURCE_DIR}/bin/compiler)
+target_link_libraries(test_compiler_backends PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_compiler_backends)
+
+# straylight-morph tests
+add_executable(test_morph test_morph.cpp
+    ${PROJECT_SOURCE_DIR}/bin/morph/quantize.cpp
+    ${PROJECT_SOURCE_DIR}/bin/morph/prune.cpp
+    ${PROJECT_SOURCE_DIR}/bin/morph/distill.cpp
+    ${PROJECT_SOURCE_DIR}/bin/morph/adapt.cpp)
+target_include_directories(test_morph PRIVATE ${PROJECT_SOURCE_DIR}/bin/morph)
+target_link_libraries(test_morph PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_morph)
+
+# straylight-snn tests
+add_executable(test_snn test_snn.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/neuron.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/network.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/plasticity.cpp
+    ${PROJECT_SOURCE_DIR}/bin/snn/simulator.cpp)
+target_include_directories(test_snn PRIVATE ${PROJECT_SOURCE_DIR}/bin/snn)
+target_link_libraries(test_snn PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_snn)
+
+# straylight-rhem tests
+add_executable(test_rhem test_rhem.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/discovery.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/allocator.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/migration.cpp
+    ${PROJECT_SOURCE_DIR}/bin/rhem/policy.cpp)
+target_include_directories(test_rhem PRIVATE ${PROJECT_SOURCE_DIR}/bin/rhem)
+target_link_libraries(test_rhem PRIVATE straylight-common straylight-ml GTest::gtest_main)
+gtest_discover_tests(test_rhem)
+```
+
+---
+
+### Task 3: Run full test suite
+
+- [ ] Run: `cmake --build build` → all 5 binaries + 7 test binaries compile
+- [ ] Run: `ctest --test-dir build -R "test_agent|test_compiler|test_morph|test_snn|test_rhem"` → all 56 tests pass:
+  - test_agent_queue: 6 tests
+  - test_agent_worker: 4 tests
+  - test_agent_distribution: 5 tests
+  - test_compiler_ir: 7 tests
+  - test_compiler_backends: 6 tests
+  - test_morph: 9 tests
+  - test_snn: 11 tests
+  - test_rhem: 11 tests (total: 59 tests)
+
+---
+
+### Task 4: Final commit
+
+- [ ] `git add CMakeLists.txt tests/unit/subsystems/CMakeLists.txt`
+- [ ] `git commit -m "feat(ml): integrate all 5 ML subsystem binaries and test suite"`
+
+---
+
+## Summary
+
+| Chunk | Binary | Type | Files | Tests |
+|-------|--------|------|-------|-------|
+| 1 | straylight-agent (event loop + queue) | daemon | 7 | 6 |
+| 2 | straylight-agent (worker pool + dist) | daemon | 4 | 9 |
+| 3 | straylight-compiler (IR) | tool | 6 | 7 |
+| 4 | straylight-compiler (backends + cache) | tool | 8 | 6 |
+| 5 | straylight-morph | tool | 9 | 9 |
+| 6 | straylight-snn | tool | 9 | 11 |
+| 7 | straylight-rhem | tool | 9 | 11 |
+| 8 | CMake integration | - | 2 | - |
+| **Total** | **5 binaries** | | **54 files** | **59 tests** |
+
+**Dependencies between chunks:**
+- Chunk 2 depends on Chunk 1 (uses TaskQueue)
+- Chunk 4 depends on Chunk 3 (uses IRGraph, passes, lowering)
+- Chunks 5, 6, 7 are independent of each other
+- Chunk 8 depends on all previous chunks
