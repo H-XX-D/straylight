@@ -12,7 +12,7 @@
 |----------|--------|
 | Rewrite strategy | Clean-room rewrite |
 | Target platform | Linux x86_64 only, Debian base |
-| Subsystem count | All 17, fully implemented (no stubs) |
+| Subsystem count | All 18, fully implemented (no stubs) |
 | Desktop shell | Wayland compositor (wlroots) + ImGui shell via layer-shell |
 | C++ standard | C++20 |
 | Build system | CMake 3.25+ with presets |
@@ -128,7 +128,7 @@ straylight/
 │       ├── straylight-entropy-dkms/dkms.conf
 │       └── straylight-enclave-dkms/dkms.conf
 │
-├── subsystems/                       # 17 userspace daemon binaries
+├── subsystems/                       # 18 userspace binaries (7 daemons, 11 on-demand tools)
 │   ├── core/                         # straylight-core (orchestrator)
 │   │   ├── CMakeLists.txt
 │   │   ├── main.cpp
@@ -325,31 +325,54 @@ straylight/
 │   │   ├── main.cpp
 │   │   └── pages/
 │   │
-│   └── wizard/                       # straylight-wizard (OOBE, post-install)
-│       ├── main.cpp
-│       ├── pages/
-│       │   ├── welcome.h/cpp
-│       │   ├── theme_picker.h/cpp
-│       │   ├── layout_config.h/cpp
-│       │   ├── ml_setup.h/cpp
-│       │   └── summary.h/cpp
-│       └── firstboot.h/cpp
+│   ├── wizard/                       # straylight-wizard (personalization, run anytime)
+│   │   ├── main.cpp
+│   │   ├── pages/
+│   │   │   ├── welcome.h/cpp
+│   │   │   ├── theme_picker.h/cpp
+│   │   │   ├── layout_config.h/cpp
+│   │   │   ├── ml_setup.h/cpp
+│   │   │   └── summary.h/cpp
+│   │   └── firstboot.h/cpp
+│   │
+│   ├── oobe/                         # straylight-oobe (first-login interactive setup)
+│   │   ├── main.cpp
+│   │   ├── pages/
+│   │   │   ├── welcome.h/cpp         # "Welcome to StrayLight"
+│   │   │   ├── account_setup.h/cpp   # Confirm admin account, add users
+│   │   │   ├── package_profile.h/cpp # ML workstation / developer / server / minimal
+│   │   │   ├── network_config.h/cpp  # WiFi/ethernet setup
+│   │   │   └── summary.h/cpp         # Review + apply
+│   │   └── oobe_state.h/cpp          # OOBE progress tracking
+│   │
+│   └── greeter/                      # straylight-greeter (login screen)
+│       ├── main.cpp                  # Wayland client via ext-session-lock-v1
+│       ├── auth.h/cpp                # PAM authentication
+│       ├── session.h/cpp             # Session selection + launch
+│       └── ui.h/cpp                  # ImGui login form rendering
 │
 ├── services/                         # systemd + D-Bus + udev
 │   ├── compositor/
-│   │   └── straylight-compositor.service
+│   │   └── straylight-compositor.service   # Type=notify, WantedBy=graphical.target
 │   ├── shell/
-│   │   └── straylight-shell.service
-│   ├── daemons/
-│   │   ├── straylight-bus.service
-│   │   ├── straylight-registry.service
-│   │   ├── straylight-scheduler.service
-│   │   ├── straylight-entropy.service
-│   │   ├── straylight-agent.service
-│   │   └── straylight-fuse.service
+│   │   └── straylight-shell.service        # After=compositor, user service
+│   ├── greeter/
+│   │   └── straylight-greeter.service      # After=compositor, Before=shell
+│   ├── daemons/                            # Persistent daemons (7 total)
+│   │   ├── straylight-core.service         # Type=notify, After=bus,registry
+│   │   ├── straylight-bus.service          # Type=notify, WantedBy=multi-user
+│   │   ├── straylight-registry.service     # After=bus
+│   │   ├── straylight-scheduler.service    # After=registry
+│   │   ├── straylight-entropy.service      # Before=registry
+│   │   ├── straylight-agent.service        # After=scheduler,registry
+│   │   └── straylight-fuse.service         # After=bus
 │   ├── dbus/
+│   │   ├── org.straylight.Core1.conf
+│   │   ├── org.straylight.Bus1.conf
 │   │   ├── org.straylight.Registry1.conf
 │   │   ├── org.straylight.Scheduler1.conf
+│   │   ├── org.straylight.Entropy1.conf
+│   │   ├── org.straylight.Agent1.conf
 │   │   ├── org.straylight.Compositor1.conf
 │   │   └── org.straylight.Shell1.conf
 │   ├── udev/
@@ -357,7 +380,8 @@ straylight/
 │   │   ├── 90-straylight-sgx.rules
 │   │   └── 90-straylight-pmem.rules
 │   └── firstboot/
-│       ├── straylight-firstboot.service
+│       ├── straylight-firstboot.service    # Type=oneshot, Before=graphical.target
+│       ├── straylight-oobe.service         # After=graphical.target, ConditionPathExists=
 │       └── straylight-oobe.target
 │
 ├── packaging/                        # Debian packages
@@ -396,6 +420,12 @@ straylight/
 │           ├── straylight-postinstall.conf
 │           └── finished.conf
 │
+├── tests/                            # Test infrastructure
+│   ├── unit/
+│   ├── integration/
+│   ├── e2e/
+│   └── CMakeLists.txt
+│
 └── config/                           # Runtime defaults
     ├── themes/
     ├── compositor/straylight-compositor.conf
@@ -405,49 +435,81 @@ straylight/
 
 ---
 
-## Boot Flow
+## Boot Flow (Three-Layer Architecture)
 
 ### Phase 1: Live USB Installer (Calamares)
 
 1. Boot from USB into live Debian environment
 2. Calamares launches with StrayLight branding
-3. **Disk selection** - user picks target disk and partition scheme
-4. **Hardware scan** - detect GPU (NVIDIA/AMD/Intel), NIC chipset, SGX capability, PMEM namespaces
-5. **Driver installation** - install nvidia-driver / firmware-amd-graphics / firmware packages from Debian repos, build StrayLight DKMS modules
-6. **Hardware test** - quick validation: GPU renders test frame, NIC has link, entropy source produces output, disk SMART OK
-7. **Create admin user** - username, password, hostname
-8. **Install to disk** - debootstrap + `apt install straylight-os`
-9. **Reboot** - pull USB, boot from disk
+3. **Disk selection** — user picks target disk and partition scheme
+4. **Hardware scan** — detect GPU (NVIDIA/AMD/Intel), NIC chipset, SGX capability, PMEM namespaces
+5. **Driver installation** — install nvidia-driver / firmware-amd-graphics / firmware packages from Debian repos, build StrayLight DKMS modules
+6. **Hardware test** — quick validation (failures are warnings, not blockers):
+   - GPU renders test frame (warning: "GPU acceleration unavailable, software rendering will be used")
+   - NIC has link (warning: "No network detected, configure later in settings")
+   - Entropy source produces output (warning: "Hardware RNG unavailable, using software fallback")
+   - Disk SMART OK (blocking: "Disk health critical, select a different disk")
+7. **Create admin user** — username, password, hostname
+8. **Install to disk** — debootstrap + `apt install straylight-os`
+9. **Reboot** — pull USB, boot from disk
 
-### Phase 2: First Boot (Desktop + Wizard)
+### Phase 2: First Boot — `straylight-firstboot` (automatic, no UI)
 
-1. Boot from disk, systemd starts all StrayLight daemons
-2. Compositor starts, shell renders desktop
-3. First boot flag detected (`/var/lib/straylight/firstboot`)
-4. Wizard launches as a normal Wayland window inside the desktop:
-   - **Welcome** to StrayLight
-   - **Theme selection** with live preview (cyberpunk / default / minimal)
-   - **Dock/panel layout** preferences
-   - **ML environment setup** - detect installed frameworks, configure GPU scheduling profile
+Runs once as a systemd service before graphical.target. No user interaction.
+
+1. `straylight-firstboot.service` executes (Type=oneshot, Before=graphical.target)
+2. Generates machine-id, SSH host keys
+3. Rebuilds DKMS modules for installed kernel
+4. Detects hardware changes since installer (hot-plugged devices)
+5. Configures kernel parameters in `/etc/sysctl.d/99-straylight.conf`
+6. Sets firstboot flag: `/var/lib/straylight/state` → `oobe`
+7. Service completes, systemd proceeds to graphical.target
+
+### Phase 3: First Boot — `straylight-oobe` (interactive, one-time)
+
+Runs as a Wayland window after the desktop loads. Triggered when state = `oobe`.
+
+1. Compositor starts, greeter skipped (auto-login for OOBE only)
+2. `straylight-oobe` launches as a fullscreen Wayland window:
+   - **Welcome** — "Welcome to StrayLight"
+   - **Account confirmation** — verify admin account, create additional users
+   - **Package profile** — ML workstation / developer / server / minimal (installs/removes packages)
+   - **Network configuration** — WiFi/ethernet setup via NetworkManager D-Bus
    - **Summary + apply**
-5. Wizard closes, removes firstboot flag
-6. User is on their configured desktop
+3. OOBE updates state: `/var/lib/straylight/state` → `wizard`
+4. System reboots or re-logs to apply profile changes
 
-### Phase 3: Normal Boot
+### Phase 4: First Boot — `straylight-wizard` (personalization)
+
+Runs as a normal Wayland window after login. Triggered when state = `wizard`.
+
+1. Greeter (login screen) renders, user logs in
+2. Desktop loads, `straylight-wizard` launches:
+   - **Theme selection** — live preview (cyberpunk / default / minimal)
+   - **Dock/panel layout** — top bar, left dock, bottom dock preferences
+   - **ML environment setup** — detect installed frameworks, configure GPU scheduling profile
+   - **Summary + apply**
+3. Wizard updates state: `/var/lib/straylight/state` → `complete`
+4. Wizard can be re-run anytime from Settings → Personalization
+
+### Phase 5: Normal Boot (every subsequent boot)
 
 1. GRUB loads kernel + initramfs
 2. systemd reaches multi-user.target:
    - `straylight-entropy.service` (entropy pool)
    - `straylight-bus.service` (IPC broker)
+   - `straylight-core.service` (orchestrator)
    - `straylight-registry.service` (config store)
    - `straylight-scheduler.service` (CPU pinning)
    - `straylight-agent.service` (task distribution)
    - `straylight-fuse.service` (tensor filesystem)
 3. systemd reaches graphical.target:
-   - `straylight-compositor.service` (Wayland server)
+   - `straylight-compositor.service` (Wayland server, Type=notify)
+   - `straylight-greeter.service` (login screen via ext-session-lock-v1)
+4. User authenticates via PAM
+5. Greeter launches user session:
    - `straylight-shell.service` (desktop panels)
-4. Login screen renders
-5. User logs in, desktop loads
+   - User's autostart applications
 
 ---
 
@@ -503,30 +565,32 @@ Each kernel module has a userspace fallback in the shared libraries. If the modu
 
 ---
 
-## 17 Subsystem Binaries
+## 18 Subsystem Binaries
 
-Each binary is a focused daemon/tool that links against the shared libraries and communicates via Unix sockets + D-Bus.
+Each binary links against the shared libraries. Classified as either a **persistent daemon** (runs continuously, has a systemd service) or an **on-demand tool** (invoked by core or CLI, exits when done).
 
-| # | Binary | Package | Purpose | Links |
-|---|--------|---------|---------|-------|
-| 1 | straylight-core | core | Pipeline orchestrator, diagnostics, inventory | common, ml, net, hw |
-| 2 | straylight-bus | core | Zero-copy tensor IPC via /dev/shm | common, ml |
-| 3 | straylight-registry | core | Persistent KV store with Raft replication | common, net |
-| 4 | straylight-scheduler | core | CPU/GPU pinning with topology awareness | common |
-| 5 | straylight-entropy | core | HWRNG pool with NIST DRBG | common, hw |
-| 6 | straylight-agent | ml | Event-driven task distribution | common, ml, net |
-| 7 | straylight-compiler | ml | Graph optimization and codegen | common, ml |
-| 8 | straylight-morph | ml | Quantization, pruning, distillation | common, ml, hw |
-| 9 | straylight-snn | ml | Spiking neural network simulator | common, ml |
-| 10 | straylight-rhem | ml | Heterogeneous device management | common, ml, hw |
-| 11 | straylight-xdp | network | eBPF/AF_XDP loader and manager | common, net + libbpf |
-| 12 | straylight-dpdk | network | DPDK packet processing pipeline | common, net, ml + libdpdk |
-| 13 | straylight-rdma-bus | network | RDMA zero-copy tensor transport | common, net, ml + libibverbs |
-| 14 | straylight-quantum | exotic | Quantum gate simulator (state vector) | common + Eigen |
-| 15 | straylight-photonics | exotic | Photonic mesh simulation + device I/O | common, hw |
-| 16 | straylight-pmem | exotic | Persistent memory allocator + checkpoints | common, hw + libpmem2 |
-| 17 | straylight-enclave | exotic | SGX secure inference | common, ml + SGX SDK |
-| -- | straylight-fuse | exotic | Transparent tensor compression filesystem | common, ml + libfuse3 |
+| # | Binary | Package | Type | Purpose | Links |
+|---|--------|---------|------|---------|-------|
+| 1 | straylight-core | core | daemon | Pipeline orchestrator, diagnostics, inventory | common, ml, net, hw |
+| 2 | straylight-bus | core | daemon | Zero-copy tensor IPC via /dev/shm | common, ml |
+| 3 | straylight-registry | core | daemon | Persistent KV store (single-node default, Raft for cluster) | common, net |
+| 4 | straylight-scheduler | core | daemon | CPU/GPU pinning with topology awareness | common |
+| 5 | straylight-entropy | core | daemon | HWRNG pool with NIST DRBG | common, hw |
+| 6 | straylight-agent | ml | daemon | Event-driven task distribution | common, ml, net |
+| 7 | straylight-compiler | ml | tool | Graph optimization and codegen | common, ml |
+| 8 | straylight-morph | ml | tool | Quantization, pruning, distillation | common, ml, hw |
+| 9 | straylight-snn | ml | tool | Spiking neural network simulator | common, ml |
+| 10 | straylight-rhem | ml | tool | Heterogeneous device management | common, ml, hw |
+| 11 | straylight-xdp | network | tool | eBPF/AF_XDP loader and manager | common, net + libbpf |
+| 12 | straylight-dpdk | network | tool | DPDK packet processing pipeline | common, net, ml + libdpdk |
+| 13 | straylight-rdma-bus | network | tool | RDMA zero-copy tensor transport | common, net, ml + libibverbs |
+| 14 | straylight-quantum | exotic | tool | Quantum gate simulator (state vector) | common + Eigen |
+| 15 | straylight-photonics | exotic | tool | Photonic mesh simulation + device I/O | common, hw |
+| 16 | straylight-pmem | exotic | tool | Persistent memory allocator + checkpoints | common, hw + libpmem2 |
+| 17 | straylight-enclave | exotic | tool | SGX secure inference | common, ml + SGX SDK |
+| 18 | straylight-fuse | exotic | daemon | Transparent tensor compression filesystem | common, ml + libfuse3 |
+
+**Kernel/userspace scheduler interaction:** `straylight-scheduler.ko` (kernel module) provides the custom `sched_class` for ML-aware task placement. The userspace `straylight-scheduler` (daemon) communicates with it via `/proc/straylight/sched` and sysfs to configure policies, profiles, and topology hints. The kernel module handles real-time scheduling decisions; the userspace daemon handles policy configuration and monitoring.
 
 ---
 
@@ -592,13 +656,18 @@ straylight-kernel
 | Dependency | Version | Used By |
 |------------|---------|---------|
 | wlroots | 0.18+ | compositor |
-| wayland-server/client | 1.22+ | compositor, shell |
+| wayland-server/client | 1.22+ | compositor, shell, apps, greeter |
+| wayland-protocols | 1.34+ | layer-shell, session-lock, xdg-shell |
 | libinput | 1.25+ | compositor |
 | pixman | 0.42+ | compositor |
-| EGL + OpenGL | - | compositor, shell |
-| ImGui | 1.90+ | shell, apps |
+| EGL + OpenGL ES 3.0 | - | compositor, shell (via wl_egl_window) |
+| ImGui | 1.90+ | shell, apps (rendered to EGL/Wayland surfaces) |
 | nlohmann/json | 3.11+ | common |
 | spdlog | 1.13+ | common |
+| sdbus-c++ | 2.0+ | common (D-Bus bindings) |
+| PAM | - | greeter (authentication) |
+| NetworkManager | 1.44+ | network configuration, OOBE |
+| PipeWire | 1.0+ | audio/video subsystem |
 | Eigen | 3.4+ | quantum |
 | libbpf | 1.3+ | xdp |
 | libdpdk | 23.11+ | dpdk |
@@ -606,5 +675,63 @@ straylight-kernel
 | libpmem2 | 1.12+ | pmem |
 | Intel SGX SDK | 2.22+ | enclave |
 | libfuse3 | 3.14+ | fuse |
-| GLFW3 | 3.3+ | shell, apps |
 | Calamares | 3.3+ | installer |
+| GTest + GMock | 1.14+ | tests |
+
+Note: GLFW is NOT used. The shell and all apps are native Wayland clients using `wl_egl_window` + EGL for ImGui rendering. The compositor uses wlroots which provides its own backend abstraction.
+
+---
+
+## Shared Library Versioning
+
+All shared libraries follow semantic versioning with SO version:
+
+| Library | SO Version | Symbol Visibility |
+|---------|-----------|-------------------|
+| libstraylight-common.so.1 | 1.0.0 | Default hidden, explicit `STRAYLIGHT_EXPORT` |
+| libstraylight-ml.so.1 | 1.0.0 | Default hidden, explicit `STRAYLIGHT_EXPORT` |
+| libstraylight-net.so.1 | 1.0.0 | Default hidden, explicit `STRAYLIGHT_EXPORT` |
+| libstraylight-hw.so.1 | 1.0.0 | Default hidden, explicit `STRAYLIGHT_EXPORT` |
+
+ABI stability: within the same SO major version, ABI is stable. Major version bumps require package rebuilds of dependents.
+
+---
+
+## Testing Infrastructure
+
+```
+tests/
+├── unit/                             # Per-library and per-subsystem unit tests
+│   ├── common/                       # libstraylight-common tests
+│   │   ├── test_config.cpp
+│   │   ├── test_ipc.cpp
+│   │   ├── test_log.cpp
+│   │   └── test_result.cpp
+│   ├── ml/                           # libstraylight-ml tests
+│   ├── net/                          # libstraylight-net tests
+│   ├── hw/                           # libstraylight-hw tests
+│   └── subsystems/                   # Per-subsystem unit tests
+│       ├── test_bus_pubsub.cpp
+│       ├── test_registry_store.cpp
+│       ├── test_scheduler_topology.cpp
+│       ├── test_entropy_drbg.cpp
+│       ├── test_compiler_passes.cpp
+│       ├── test_quantum_gates.cpp
+│       └── ...
+├── integration/                      # Cross-subsystem integration tests
+│   ├── test_bus_registry_flow.cpp    # Bus → Registry data flow
+│   ├── test_core_pipeline.cpp        # Core orchestrating multiple subsystems
+│   ├── test_compositor_shell.cpp     # Compositor ↔ shell IPC
+│   └── test_boot_sequence.cpp        # Daemon startup ordering
+├── e2e/                              # End-to-end system tests
+│   ├── test_installer.sh             # Calamares ISO install in QEMU
+│   ├── test_firstboot.sh             # Three-layer boot sequence
+│   └── test_desktop_session.sh       # Login → desktop → app launch
+└── CMakeLists.txt                    # Test targets, CTest integration
+```
+
+CMakePresets.json includes:
+- `dev` preset: Debug, sanitizers (ASan + UBSan), tests ON
+- `release` preset: Release, LTO, tests OFF
+- `package` preset: RelWithDebInfo, tests OFF, packaging ON
+- `test` preset: Debug, coverage (gcov), tests ON
