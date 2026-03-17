@@ -63,6 +63,12 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(tools/flux-cli)
     add_subdirectory(tools/trace)
     add_subdirectory(tools/garden)
+    add_subdirectory(tools/capsule)
+    add_subdirectory(services/nerve)
+    add_subdirectory(tools/nerve-cli)
+    add_subdirectory(tools/echo)
+    add_subdirectory(services/weave)
+    add_subdirectory(tools/weave-cli)
 endif()
 
 # Compositor
