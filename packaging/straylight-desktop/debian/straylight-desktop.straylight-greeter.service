@@ -1,0 +1,19 @@
+[Unit]
+Description=StrayLight Login Greeter
+Documentation=https://straylight.dev/docs/greeter
+After=straylight-compositor.service
+Requires=straylight-compositor.service
+Before=straylight-shell.service
+ConditionPathExists=!/var/lib/straylight/state.oobe
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/straylight-greeter
+Restart=on-failure
+RestartSec=1s
+User=root
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/0
+
+[Install]
+WantedBy=graphical.target

@@ -1,6 +1,5 @@
 // apps/clipboard/main.cpp
 // StrayLight Clipboard Manager — Wayland + EGL + ImGui
-// List view with search, pin items, clear, click-to-copy-back.
 #include "history.h"
 #include "watcher.h"
 
@@ -11,481 +10,405 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <wayland-egl.h>
-#include <imgui.h>
-#include <imgui_impl_opengl3.h>
 #include <xdg-shell-client-protocol.h>
 
-// wlr-data-control protocol for writing back to clipboard
-#ifdef HAVE_DATA_CONTROL_PROTOCOL
-#include <wlr-data-control-unstable-v1-client-protocol.h>
-#endif
+#include <imgui.h>
+#include <imgui_impl_opengl3.h>
 
+#include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <mutex>
-#include <thread>
-#include <unistd.h>
+#include <string>
 #include <vector>
 
-namespace {
-
+using namespace straylight;
 using namespace straylight::clipboard;
+
+namespace {
 
 std::atomic<bool> g_running{true};
 void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
 
 // ---------------------------------------------------------------------------
-// Wayland state
+// Wayland / EGL boilerplate (shared pattern)
 // ---------------------------------------------------------------------------
 
 struct WaylandState {
-    wl_display*    display          = nullptr;
-    wl_registry*   registry         = nullptr;
-    wl_compositor* compositor       = nullptr;
-    wl_seat*       seat             = nullptr;
-    xdg_wm_base*   xdg_wm_base_ptr = nullptr;
-    wl_surface*    surface          = nullptr;
-    xdg_surface*   xdg_surface_ptr  = nullptr;
-    xdg_toplevel*  toplevel         = nullptr;
-    wl_egl_window* egl_window       = nullptr;
+    wl_display*    display    = nullptr;
+    wl_registry*   registry   = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_seat*       seat       = nullptr;
+    wl_pointer*    pointer    = nullptr;
+    wl_keyboard*   keyboard   = nullptr;
+    xdg_wm_base*   xdg_wm    = nullptr;
+    wl_surface*    surface    = nullptr;
+    xdg_surface*   xdg_surf  = nullptr;
+    xdg_toplevel*  toplevel  = nullptr;
 
-#ifdef HAVE_DATA_CONTROL_PROTOCOL
-    zwlr_data_control_manager_v1* dc_manager = nullptr;
-#endif
-
-    int  width = 520, height = 700;
-    bool configured = false, needs_resize = false;
+    int   width      = 420;
+    int   height     = 640;
+    bool  configured = false;
+    float mouse_x    = 0.0f;
+    float mouse_y    = 0.0f;
+    bool  mouse_buttons[5] = {};
 };
 
-void reg_global(void* data, wl_registry* reg, uint32_t name,
-                const char* iface, uint32_t ver);
-void reg_global_remove(void*, wl_registry*, uint32_t) {}
-const wl_registry_listener reg_listener = {
-    .global        = reg_global,
-    .global_remove = reg_global_remove,
+WaylandState g_wl;
+
+static const wl_pointer_listener ptr_l = {
+    [](void*, wl_pointer*, uint32_t, wl_surface*, wl_fixed_t x, wl_fixed_t y) {
+        g_wl.mouse_x = wl_fixed_to_double(x); g_wl.mouse_y = wl_fixed_to_double(y);
+    },
+    [](void*, wl_pointer*, uint32_t, wl_surface*) {},
+    [](void*, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y) {
+        g_wl.mouse_x = wl_fixed_to_double(x); g_wl.mouse_y = wl_fixed_to_double(y);
+    },
+    [](void*, wl_pointer*, uint32_t, uint32_t, uint32_t btn, uint32_t s) {
+        int i = (btn==272)?0:(btn==273)?1:(btn==274)?2:-1;
+        if (i>=0) g_wl.mouse_buttons[i] = (s==1);
+    },
+    [](void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t v) {
+        ImGui::GetIO().MouseWheel -= wl_fixed_to_double(v) / 10.0;
+    },
+    nullptr,nullptr,nullptr,nullptr,nullptr,
 };
-void wm_ping(void*, xdg_wm_base* b, uint32_t s) { xdg_wm_base_pong(b, s); }
-const xdg_wm_base_listener wm_listener = { .ping = wm_ping };
-void surf_configure(void* d, xdg_surface* s, uint32_t serial) {
-    xdg_surface_ack_configure(s, serial);
-    static_cast<WaylandState*>(d)->configured = true;
+
+static const wl_keyboard_listener kbd_l = {
+    [](void*,wl_keyboard*,uint32_t,int32_t,uint32_t){},
+    [](void*,wl_keyboard*,uint32_t,wl_surface*,wl_array*){},
+    [](void*,wl_keyboard*,uint32_t,wl_surface*){},
+    [](void*,wl_keyboard*,uint32_t,uint32_t,uint32_t,uint32_t){},
+    [](void*,wl_keyboard*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){},
+    nullptr,
+};
+
+static const wl_seat_listener seat_l = {
+    [](void*, wl_seat* s, uint32_t caps) {
+        if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g_wl.pointer) {
+            g_wl.pointer = wl_seat_get_pointer(s);
+            wl_pointer_add_listener(g_wl.pointer, &ptr_l, nullptr);
+        }
+        if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !g_wl.keyboard) {
+            g_wl.keyboard = wl_seat_get_keyboard(s);
+            wl_keyboard_add_listener(g_wl.keyboard, &kbd_l, nullptr);
+        }
+    },
+    [](void*,wl_seat*,const char*){},
+};
+
+static const xdg_surface_listener xdg_surf_l = {
+    [](void*, xdg_surface* xs, uint32_t serial) {
+        xdg_surface_ack_configure(xs, serial); g_wl.configured = true;
+    },
+};
+
+static const xdg_toplevel_listener toplevel_l = {
+    [](void*, xdg_toplevel*, int32_t w, int32_t h, wl_array*) {
+        if (w>0&&h>0){g_wl.width=w;g_wl.height=h;}
+    },
+    [](void*, xdg_toplevel*) { g_running.store(false, std::memory_order_relaxed); },
+    nullptr, nullptr,
+};
+
+static const xdg_wm_base_listener wm_l = {
+    [](void*, xdg_wm_base* wm, uint32_t s){ xdg_wm_base_pong(wm,s); },
+};
+
+static const wl_registry_listener reg_l = {
+    [](void*, wl_registry* reg, uint32_t name, const char* iface, uint32_t ver) {
+        if (!std::strcmp(iface, wl_compositor_interface.name))
+            g_wl.compositor = static_cast<wl_compositor*>(
+                wl_registry_bind(reg, name, &wl_compositor_interface, 4));
+        else if (!std::strcmp(iface, xdg_wm_base_interface.name)) {
+            g_wl.xdg_wm = static_cast<xdg_wm_base*>(
+                wl_registry_bind(reg, name, &xdg_wm_base_interface, 1));
+            xdg_wm_base_add_listener(g_wl.xdg_wm, &wm_l, nullptr);
+        } else if (!std::strcmp(iface, wl_seat_interface.name)) {
+            g_wl.seat = static_cast<wl_seat*>(
+                wl_registry_bind(reg, name, &wl_seat_interface, std::min(ver, 5u)));
+            wl_seat_add_listener(g_wl.seat, &seat_l, nullptr);
+        }
+    },
+    [](void*, wl_registry*, uint32_t){},
+};
+
+struct EGLState {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+    wl_egl_window* window = nullptr;
+};
+EGLState g_egl;
+
+bool egl_init() {
+    g_egl.display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_EXT, g_wl.display, nullptr);
+    if (g_egl.display == EGL_NO_DISPLAY) return false;
+    EGLint major=0,minor=0;
+    if (!eglInitialize(g_egl.display,&major,&minor)) return false;
+    eglBindAPI(EGL_OPENGL_ES_API);
+    const EGLint ca[] = {
+        EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,
+        EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE
+    };
+    EGLConfig cfg=nullptr; EGLint nc=0;
+    if (!eglChooseConfig(g_egl.display,ca,&cfg,1,&nc)||nc<1) return false;
+    const EGLint cxa[]={EGL_CONTEXT_MAJOR_VERSION,3,EGL_NONE};
+    g_egl.context = eglCreateContext(g_egl.display,cfg,EGL_NO_CONTEXT,cxa);
+    if (g_egl.context==EGL_NO_CONTEXT) return false;
+    g_egl.window  = wl_egl_window_create(g_wl.surface, g_wl.width, g_wl.height);
+    g_egl.surface = eglCreateWindowSurface(g_egl.display,cfg,
+        reinterpret_cast<EGLNativeWindowType>(g_egl.window), nullptr);
+    return eglMakeCurrent(g_egl.display,g_egl.surface,g_egl.surface,g_egl.context);
 }
-const xdg_surface_listener surf_listener = { .configure = surf_configure };
-void tl_configure(void* d, xdg_toplevel*, int32_t w, int32_t h, wl_array*) {
-    auto* ws = static_cast<WaylandState*>(d);
-    if (w > 0 && h > 0 && (w != ws->width || h != ws->height)) {
-        ws->width = w; ws->height = h; ws->needs_resize = true;
+
+void egl_shutdown() {
+    if (g_egl.display!=EGL_NO_DISPLAY) {
+        eglMakeCurrent(g_egl.display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
+        if (g_egl.surface!=EGL_NO_SURFACE) eglDestroySurface(g_egl.display,g_egl.surface);
+        if (g_egl.context!=EGL_NO_CONTEXT) eglDestroyContext(g_egl.display,g_egl.context);
+        eglTerminate(g_egl.display);
     }
+    if (g_egl.window) wl_egl_window_destroy(g_egl.window);
 }
-void tl_close(void*, xdg_toplevel*) { g_running.store(false, std::memory_order_relaxed); }
-void tl_bounds(void*, xdg_toplevel*, int32_t, int32_t) {}
-void tl_caps(void*, xdg_toplevel*, wl_array*) {}
-const xdg_toplevel_listener tl_listener = {
-    .configure        = tl_configure,
-    .close            = tl_close,
-    .configure_bounds = tl_bounds,
-    .wm_capabilities  = tl_caps,
-};
-void seat_caps(void*, wl_seat*, uint32_t) {}
-void seat_name(void*, wl_seat*, const char*) {}
-const wl_seat_listener seat_listener = { .capabilities = seat_caps, .name = seat_name };
 
-void reg_global(void* data, wl_registry* reg, uint32_t name,
-                const char* iface, uint32_t ver) {
-    auto* ws = static_cast<WaylandState*>(data);
-    if (std::strcmp(iface, wl_compositor_interface.name) == 0)
-        ws->compositor = static_cast<wl_compositor*>(
-            wl_registry_bind(reg, name, &wl_compositor_interface, std::min(ver, 4u)));
-    else if (std::strcmp(iface, xdg_wm_base_interface.name) == 0) {
-        ws->xdg_wm_base_ptr = static_cast<xdg_wm_base*>(
-            wl_registry_bind(reg, name, &xdg_wm_base_interface, std::min(ver, 2u)));
-        xdg_wm_base_add_listener(ws->xdg_wm_base_ptr, &wm_listener, ws);
-    } else if (std::strcmp(iface, wl_seat_interface.name) == 0) {
-        ws->seat = static_cast<wl_seat*>(
-            wl_registry_bind(reg, name, &wl_seat_interface, std::min(ver, 5u)));
-        wl_seat_add_listener(ws->seat, &seat_listener, ws);
-    }
-#ifdef HAVE_DATA_CONTROL_PROTOCOL
-    else if (std::strcmp(iface, zwlr_data_control_manager_v1_interface.name) == 0) {
-        ws->dc_manager = static_cast<zwlr_data_control_manager_v1*>(
-            wl_registry_bind(reg, name,
-                             &zwlr_data_control_manager_v1_interface,
-                             std::min(ver, 2u)));
-    }
-#endif
+bool wayland_init() {
+    g_wl.display = wl_display_connect(nullptr);
+    if (!g_wl.display) return false;
+    g_wl.registry = wl_display_get_registry(g_wl.display);
+    wl_registry_add_listener(g_wl.registry, &reg_l, nullptr);
+    wl_display_roundtrip(g_wl.display);
+    if (!g_wl.compositor || !g_wl.xdg_wm) return false;
+    g_wl.surface  = wl_compositor_create_surface(g_wl.compositor);
+    g_wl.xdg_surf = xdg_wm_base_get_xdg_surface(g_wl.xdg_wm, g_wl.surface);
+    xdg_surface_add_listener(g_wl.xdg_surf, &xdg_surf_l, nullptr);
+    g_wl.toplevel = xdg_surface_get_toplevel(g_wl.xdg_surf);
+    xdg_toplevel_add_listener(g_wl.toplevel, &toplevel_l, nullptr);
+    xdg_toplevel_set_title(g_wl.toplevel,  "StrayLight Clipboard");
+    xdg_toplevel_set_app_id(g_wl.toplevel, "straylight.clipboard");
+    wl_surface_commit(g_wl.surface);
+    wl_display_roundtrip(g_wl.display);
+    return true;
 }
+
+void wayland_shutdown() {
+    if (g_wl.toplevel)    xdg_toplevel_destroy(g_wl.toplevel);
+    if (g_wl.xdg_surf)    xdg_surface_destroy(g_wl.xdg_surf);
+    if (g_wl.surface)     wl_surface_destroy(g_wl.surface);
+    if (g_wl.pointer)     wl_pointer_destroy(g_wl.pointer);
+    if (g_wl.keyboard)    wl_keyboard_destroy(g_wl.keyboard);
+    if (g_wl.seat)        wl_seat_destroy(g_wl.seat);
+    if (g_wl.xdg_wm)     xdg_wm_base_destroy(g_wl.xdg_wm);
+    if (g_wl.compositor)  wl_compositor_destroy(g_wl.compositor);
+    if (g_wl.registry)    wl_registry_destroy(g_wl.registry);
+    if (g_wl.display)     wl_display_disconnect(g_wl.display);
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
-// Copy text back to clipboard via zwlr_data_control_manager_v1
-// ---------------------------------------------------------------------------
-
-struct SendCtx {
-    std::string text;
-    std::mutex  mtx;
-};
-
-#ifdef HAVE_DATA_CONTROL_PROTOCOL
-void dc_source_send(void* data,
-                    zwlr_data_control_source_v1* src,
-                    const char* /*mime*/,
-                    int32_t fd) {
-    auto* ctx = static_cast<SendCtx*>(data);
-    std::lock_guard lock(ctx->mtx);
-    const char* p   = ctx->text.data();
-    ssize_t     rem = static_cast<ssize_t>(ctx->text.size());
-    while (rem > 0) {
-        ssize_t n = ::write(fd, p, static_cast<size_t>(rem));
-        if (n <= 0) break;
-        p += n; rem -= n;
-    }
-    ::close(fd);
-}
-
-void dc_source_cancelled(void* data, zwlr_data_control_source_v1* src) {
-    auto* ctx = static_cast<SendCtx*>(data);
-    delete ctx;
-    zwlr_data_control_source_v1_destroy(src);
-}
-
-const zwlr_data_control_source_v1_listener dc_src_listener = {
-    .send      = dc_source_send,
-    .cancelled = dc_source_cancelled,
-};
-
-void copy_to_clipboard(WaylandState& ws, const std::string& text) {
-    if (!ws.dc_manager || !ws.seat) return;
-
-    auto* src = zwlr_data_control_manager_v1_create_data_source(ws.dc_manager);
-    zwlr_data_control_source_v1_offer(src, "text/plain;charset=utf-8");
-    zwlr_data_control_source_v1_offer(src, "text/plain");
-    zwlr_data_control_source_v1_offer(src, "UTF8_STRING");
-
-    auto* ctx  = new SendCtx;
-    ctx->text  = text;
-    zwlr_data_control_source_v1_add_listener(src, &dc_src_listener, ctx);
-
-    // Get (or create) a device for this seat
-    auto* device = zwlr_data_control_manager_v1_get_data_device(ws.dc_manager, ws.seat);
-    zwlr_data_control_device_v1_set_selection(device, src);
-    zwlr_data_control_device_v1_destroy(device);
-
-    wl_display_flush(ws.display);
-}
-#else
-void copy_to_clipboard(WaylandState& /*ws*/, const std::string& /*text*/) {
-    // Without the protocol, we can't set the clipboard from a background app.
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// Apply theme
-// ---------------------------------------------------------------------------
-
-void apply_theme() {
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 0.0f; s.FrameRounding = 4.0f;
-    s.ItemSpacing = ImVec2(8.0f, 6.0f); s.FramePadding = ImVec2(6.0f, 4.0f);
-    s.WindowPadding = ImVec2(10.0f, 10.0f);
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]      = ImVec4(0.08f, 0.08f, 0.13f, 1.0f);
-    c[ImGuiCol_ChildBg]       = ImVec4(0.10f, 0.10f, 0.16f, 1.0f);
-    c[ImGuiCol_FrameBg]       = ImVec4(0.14f, 0.14f, 0.22f, 1.0f);
-    c[ImGuiCol_Button]        = ImVec4(0.0f,  0.55f, 0.38f, 0.8f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.0f,  0.80f, 0.55f, 1.0f);
-    c[ImGuiCol_ButtonActive]  = ImVec4(0.0f,  1.00f, 0.67f, 1.0f);
-    c[ImGuiCol_Header]        = ImVec4(0.0f,  0.55f, 0.38f, 0.6f);
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.0f,  0.80f, 0.55f, 0.8f);
-    c[ImGuiCol_HeaderActive]  = ImVec4(0.0f,  1.00f, 0.67f, 1.0f);
-    c[ImGuiCol_Separator]     = ImVec4(0.20f, 0.20f, 0.32f, 1.0f);
-    c[ImGuiCol_Border]        = ImVec4(0.20f, 0.20f, 0.32f, 1.0f);
-    c[ImGuiCol_Text]          = ImVec4(0.90f, 0.90f, 0.90f, 1.0f);
-    c[ImGuiCol_TextDisabled]  = ImVec4(0.50f, 0.50f, 0.50f, 1.0f);
-    c[ImGuiCol_ScrollbarBg]   = ImVec4(0.08f, 0.08f, 0.13f, 1.0f);
-    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.20f, 0.20f, 0.32f, 1.0f);
-}
-
-} // anonymous namespace
-
-// ---------------------------------------------------------------------------
-// main()
+// main
 // ---------------------------------------------------------------------------
 
 int main(int /*argc*/, char* /*argv*/[]) {
-    using namespace straylight;
-    using namespace straylight::clipboard;
-
-    Log::init("straylight-clipboard");
-    SL_INFO("StrayLight Clipboard Manager starting");
-
-    std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
 
-    // --- Wayland ----------------------------------------------------------
-    WaylandState ws;
-    ws.display = wl_display_connect(nullptr);
-    if (!ws.display) { SL_CRITICAL("No Wayland display"); return EXIT_FAILURE; }
-    ws.registry = wl_display_get_registry(ws.display);
-    wl_registry_add_listener(ws.registry, &reg_listener, &ws);
-    wl_display_roundtrip(ws.display);
+    if (!wayland_init()) { SL_LOG_ERROR("clipboard", "Wayland init failed"); return 1; }
+    if (!egl_init())     { SL_LOG_ERROR("clipboard", "EGL init failed");     return 1; }
 
-    if (!ws.compositor || !ws.xdg_wm_base_ptr) {
-        SL_CRITICAL("Missing required Wayland globals");
-        wl_display_disconnect(ws.display);
-        return EXIT_FAILURE;
-    }
+    while (!g_wl.configured) wl_display_dispatch(g_wl.display);
 
-    ws.surface         = wl_compositor_create_surface(ws.compositor);
-    ws.xdg_surface_ptr = xdg_wm_base_get_xdg_surface(ws.xdg_wm_base_ptr, ws.surface);
-    xdg_surface_add_listener(ws.xdg_surface_ptr, &surf_listener, &ws);
-    ws.toplevel = xdg_surface_get_toplevel(ws.xdg_surface_ptr);
-    xdg_toplevel_add_listener(ws.toplevel, &tl_listener, &ws);
-    xdg_toplevel_set_title(ws.toplevel, "StrayLight Clipboard");
-    xdg_toplevel_set_app_id(ws.toplevel, "straylight-clipboard");
-    xdg_toplevel_set_min_size(ws.toplevel, 360, 500);
-    wl_surface_commit(ws.surface);
-    wl_display_roundtrip(ws.display);
-
-    // --- EGL --------------------------------------------------------------
-    EGLDisplay egl_disp = eglGetDisplay(
-        reinterpret_cast<EGLNativeDisplayType>(ws.display));
-    EGLint major = 0, minor = 0;
-    eglInitialize(egl_disp, &major, &minor);
-    constexpr EGLint cfg_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 24, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE
-    };
-    EGLConfig egl_cfg = nullptr; EGLint num_cfgs = 0;
-    eglChooseConfig(egl_disp, cfg_attribs, &egl_cfg, 1, &num_cfgs);
-    ws.egl_window = wl_egl_window_create(ws.surface, ws.width, ws.height);
-    EGLSurface egl_surf = eglCreateWindowSurface(egl_disp, egl_cfg,
-        reinterpret_cast<EGLNativeWindowType>(ws.egl_window), nullptr);
-    constexpr EGLint ctx_attribs[] = {
-        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE
-    };
-    EGLContext egl_ctx = eglCreateContext(egl_disp, egl_cfg,
-                                          EGL_NO_CONTEXT, ctx_attribs);
-    eglMakeCurrent(egl_disp, egl_surf, egl_surf, egl_ctx);
-
-    // --- ImGui ------------------------------------------------------------
+    IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize  = ImVec2(float(ws.width), float(ws.height));
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.DisplaySize = ImVec2(static_cast<float>(g_wl.width), static_cast<float>(g_wl.height));
+    ImGui::StyleColorsDark();
+    ImVec4* colors = ImGui::GetStyle().Colors;
+    colors[ImGuiCol_WindowBg]       = ImVec4(0.07f, 0.07f, 0.09f, 0.97f);
+    colors[ImGuiCol_TitleBgActive]  = ImVec4(0.18f, 0.0f,  0.30f, 1.0f);
+    colors[ImGuiCol_Button]         = ImVec4(0.18f, 0.0f,  0.28f, 1.0f);
+    colors[ImGuiCol_ButtonHovered]  = ImVec4(0.32f, 0.0f,  0.50f, 1.0f);
+    colors[ImGuiCol_FrameBg]        = ImVec4(0.12f, 0.12f, 0.16f, 1.0f);
+
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    apply_theme();
 
-    // --- Clipboard engine -------------------------------------------------
-    ClipHistory history;
-    (void)history.load();
+    // Clipboard state
+    ClipHistory  history;
+    history.load();
 
-    ClipWatcher watcher;
-    (void)watcher.start(ws.display, history, [](const ClipEntry& /*e*/) {
-        // Notification hook — could update a tray icon badge in the future
-    });
-
-    // --- App state --------------------------------------------------------
-    char search_buf[256] = {};
-    std::string status_msg;
-    std::chrono::steady_clock::time_point status_until{};
-
-    auto set_status = [&](const std::string& msg) {
-        status_msg   = msg;
-        status_until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    };
-
-    SL_INFO("Clipboard Manager UI ready; {} entries loaded", history.size());
-
-    // --- Main loop --------------------------------------------------------
-    while (g_running.load(std::memory_order_relaxed)) {
-        wl_display_dispatch_pending(ws.display);
-        wl_display_flush(ws.display);
-
-        if (ws.needs_resize) {
-            ws.needs_resize = false;
-            wl_egl_window_resize(ws.egl_window, ws.width, ws.height, 0, 0);
-            io.DisplaySize = ImVec2(float(ws.width), float(ws.height));
+    ClipboardWatcher watcher;
+    {
+        auto res = watcher.connect();
+        if (!res.has_value()) {
+            SL_LOG_WARN("clipboard", "Watcher connect failed: {}",
+                         res.error().message());
+        } else {
+            watcher.start([&](ClipEntry e) {
+                if (e.kind == EntryKind::Text)
+                    history.push_text(std::move(e.text), e.mime);
+                else
+                    history.push_image(std::move(e.image_data), e.mime);
+            });
         }
+    }
+
+    char search_buf[256] = {};
+    bool show_confirm_clear = false;
+
+    // ---------------------------------------------------------------------------
+    // Main loop
+    // ---------------------------------------------------------------------------
+    while (g_running.load(std::memory_order_relaxed)) {
+        wl_display_dispatch_pending(g_wl.display);
+        if (wl_display_flush(g_wl.display) < 0) break;
+
+        if (g_wl.width != static_cast<int>(io.DisplaySize.x) ||
+            g_wl.height != static_cast<int>(io.DisplaySize.y)) {
+            wl_egl_window_resize(g_egl.window, g_wl.width, g_wl.height, 0, 0);
+        }
+
+        io.DisplaySize = ImVec2(static_cast<float>(g_wl.width),
+                                static_cast<float>(g_wl.height));
+        io.DeltaTime   = 1.0f / 60.0f;
+        io.MousePos    = ImVec2(g_wl.mouse_x, g_wl.mouse_y);
+        for (int b = 0; b < 5; ++b) io.MouseDown[b] = g_wl.mouse_buttons[b];
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-        ImGui::SetNextWindowSize(io.DisplaySize);
-        constexpr ImGuiWindowFlags kWin =
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoBringToDisplayFront;
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(g_wl.width),
+                                        static_cast<float>(g_wl.height)), ImGuiCond_Always);
+        ImGui::Begin("##clip_root", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_MenuBar);
 
-        if (ImGui::Begin("##Clipboard", nullptr, kWin)) {
-            // Title bar
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 1.0f, 0.67f, 1.0f));
-            ImGui::Text("STRAYLIGHT CLIPBOARD");
-            ImGui::PopStyleColor();
-            ImGui::SameLine(io.DisplaySize.x - 60.0f);
-            if (ImGui::SmallButton("Close"))
-                g_running.store(false, std::memory_order_relaxed);
-            ImGui::Separator();
-
-            // Search + toolbar row
-            ImGui::SetNextItemWidth(io.DisplaySize.x * 0.5f);
-            ImGui::InputText("##search", search_buf, sizeof(search_buf));
-            ImGui::SameLine(0.0f, 12.0f);
-            if (ImGui::Button("Clear All")) {
-                history.clear_all();
-                (void)history.save();
-                set_status("Cleared all entries.");
+        // Menu bar
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("Edit")) {
+                if (ImGui::MenuItem("Clear unpinned")) history.clear_unpinned();
+                if (ImGui::MenuItem("Clear all..."))   show_confirm_clear = true;
+                ImGui::EndMenu();
             }
-            ImGui::SameLine(0.0f, 8.0f);
-            if (ImGui::Button("Clear Unpinned")) {
-                history.clear_unpinned();
-                (void)history.save();
-                set_status("Cleared unpinned entries.");
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Save history")) history.save();
+                if (ImGui::MenuItem("Quit")) g_running.store(false, std::memory_order_relaxed);
+                ImGui::EndMenu();
             }
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            const auto entries = history.entries();
-            std::string filter(search_buf);
-
-            // Compute filtered list indices
-            std::vector<size_t> filtered;
-            for (size_t i = 0; i < entries.size(); ++i) {
-                if (filter.empty()) {
-                    filtered.push_back(i);
-                } else {
-                    const std::string& text =
-                        entries[i].kind == EntryKind::Text ? entries[i].text : entries[i].mime;
-                    if (text.find(filter) != std::string::npos)
-                        filtered.push_back(i);
-                }
-            }
-
-            ImGui::Text("%zu / %zu entries", filtered.size(), entries.size());
-            ImGui::Spacing();
-
-            float list_h = io.DisplaySize.y - 110.0f;
-            if (!status_msg.empty() &&
-                std::chrono::steady_clock::now() < status_until) {
-                list_h -= 22.0f;
-            }
-
-            if (ImGui::BeginChild("##list", ImVec2(0.0f, list_h), false,
-                                  ImGuiWindowFlags_HorizontalScrollbar)) {
-                for (size_t fi = 0; fi < filtered.size(); ++fi) {
-                    size_t idx = filtered[fi];
-                    const auto& e = entries[idx];
-
-                    ImGui::PushID(static_cast<int>(idx));
-
-                    // Row background highlight for pinned
-                    if (e.pinned) {
-                        ImVec2 row_min = ImGui::GetCursorScreenPos();
-                        float row_w    = ImGui::GetContentRegionAvail().x;
-                        ImGui::GetWindowDrawList()->AddRectFilled(
-                            row_min,
-                            ImVec2(row_min.x + row_w, row_min.y + ImGui::GetTextLineHeightWithSpacing()),
-                            IM_COL32(0, 80, 50, 60));
-                    }
-
-                    // Index + pin indicator
-                    ImGui::TextDisabled("%03zu", fi + 1);
-                    ImGui::SameLine(0.0f, 6.0f);
-                    if (e.pinned) {
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                              ImVec4(0.0f, 1.0f, 0.67f, 1.0f));
-                        ImGui::TextUnformatted("[P]");
-                        ImGui::PopStyleColor();
-                    } else {
-                        ImGui::TextDisabled("   ");
-                    }
-                    ImGui::SameLine(0.0f, 6.0f);
-
-                    // Preview text — click copies back
-                    std::string preview = e.preview(100);
-                    bool clicked = ImGui::Selectable(preview.c_str(), false,
-                                                      0, ImVec2(0.0f, 0.0f));
-                    if (clicked && e.kind == EntryKind::Text) {
-                        copy_to_clipboard(ws, e.text);
-                        set_status("Copied: " + e.preview(40));
-                    }
-                    if (ImGui::IsItemHovered() && e.kind == EntryKind::Text) {
-                        ImGui::SetTooltip("Click to copy back to clipboard");
-                    }
-
-                    // Action buttons on the right
-                    float btn_x = ImGui::GetContentRegionAvail().x;
-                    ImGui::SameLine(ImGui::GetWindowWidth() - 115.0f);
-
-                    if (ImGui::SmallButton(e.pinned ? "Unpin" : "Pin")) {
-                        history.toggle_pin(idx);
-                        (void)history.save();
-                    }
-                    ImGui::SameLine(0.0f, 4.0f);
-                    if (ImGui::SmallButton("Del")) {
-                        history.remove(idx);
-                        (void)history.save();
-                        ImGui::PopID();
-                        break; // entries changed, restart iteration
-                    }
-
-                    ImGui::PopID();
-                    ImGui::Separator();
-                }
-            }
-            ImGui::EndChild();
-
-            // Status bar
-            if (!status_msg.empty() &&
-                std::chrono::steady_clock::now() < status_until) {
-                ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 1.0f, 0.67f, 1.0f));
-                ImGui::TextUnformatted(status_msg.c_str());
-                ImGui::PopStyleColor();
-            }
+            ImGui::EndMenuBar();
         }
+
+        // Title
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.5f, 1.0f, 1.0f));
+        ImGui::Text("Clipboard History (%zu entries)", history.size());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+
+        // Search bar
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##search", "Search...", search_buf, sizeof(search_buf));
+        ImGui::Spacing();
+
+        // Entry list
+        const std::string filter(search_buf);
+        auto entries = history.entries();
+
+        ImGui::BeginChild("##entries", ImVec2(0, -28.0f), false);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const ClipEntry& e = entries[i];
+            const std::string preview = e.preview(60);
+
+            // Apply search filter
+            if (!filter.empty()) {
+                if (e.kind != EntryKind::Text) continue; // Can't search images
+                std::string lc_preview = preview;
+                std::string lc_filter  = filter;
+                for (auto& c : lc_preview) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                for (auto& c : lc_filter)  c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lc_preview.find(lc_filter) == std::string::npos) continue;
+            }
+
+            ImGui::PushID(static_cast<int>(i));
+
+            // Pin indicator
+            if (e.pinned) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.0f, 1.0f));
+                ImGui::TextUnformatted("[PIN]");
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
+
+            // Entry text
+            const bool is_img = (e.kind == EntryKind::Image);
+            if (is_img) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.8f, 1.0f, 1.0f));
+            if (ImGui::Selectable(preview.c_str(), false,
+                                   ImGuiSelectableFlags_AllowDoubleClick)) {
+                // Single-click: copy to clipboard (conceptually — we use a log here)
+                // In a real Wayland app you'd set a wl_data_source; for now log intent
+                SL_LOG_INFO("clipboard", "Selected entry {}: {}", i, preview);
+            }
+            if (is_img) ImGui::PopStyleColor();
+
+            // Context menu
+            if (ImGui::BeginPopupContextItem("##ctx")) {
+                if (ImGui::MenuItem(e.pinned ? "Unpin" : "Pin"))
+                    history.toggle_pin(i);
+                if (ImGui::MenuItem("Remove"))
+                    history.remove(i);
+                ImGui::EndPopup();
+            }
+
+            if (ImGui::IsItemHovered() && e.kind == EntryKind::Text && e.text.size() > 60) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(400.0f);
+                ImGui::TextUnformatted(e.text.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        // Bottom status
+        ImGui::Separator();
+        ImGui::Text("%zu entries  |  %s",
+                    history.size(),
+                    watcher.running() ? "Monitoring" : "Not monitoring");
+
+        // Confirm clear dialog
+        if (show_confirm_clear) { ImGui::OpenPopup("Confirm##clear"); show_confirm_clear = false; }
+        if (ImGui::BeginPopupModal("Confirm##clear", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Clear ALL clipboard history (including pinned)?");
+            ImGui::Spacing();
+            if (ImGui::Button("Yes, clear all", ImVec2(140, 0))) {
+                history.clear_all();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(80, 0))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
         ImGui::End();
 
+        // Render
         ImGui::Render();
-        glViewport(0, 0, ws.width, ws.height);
-        glClearColor(0.08f, 0.08f, 0.13f, 1.0f);
+        glViewport(0, 0, g_wl.width, g_wl.height);
+        glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        eglSwapBuffers(egl_disp, egl_surf);
-
-        usleep(16000);
+        eglSwapBuffers(g_egl.display, g_egl.surface);
     }
 
-    // --- Cleanup ----------------------------------------------------------
-    SL_INFO("Clipboard Manager shutting down");
     watcher.stop();
-    (void)history.save();
-
+    history.save();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui::DestroyContext();
-
-    eglMakeCurrent(egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    eglDestroySurface(egl_disp, egl_surf);
-    eglDestroyContext(egl_disp, egl_ctx);
-    eglTerminate(egl_disp);
-
-    wl_egl_window_destroy(ws.egl_window);
-    xdg_toplevel_destroy(ws.toplevel);
-    xdg_surface_destroy(ws.xdg_surface_ptr);
-    wl_surface_destroy(ws.surface);
-    if (ws.seat) wl_seat_destroy(ws.seat);
-#ifdef HAVE_DATA_CONTROL_PROTOCOL
-    if (ws.dc_manager) zwlr_data_control_manager_v1_destroy(ws.dc_manager);
-#endif
-    xdg_wm_base_destroy(ws.xdg_wm_base_ptr);
-    wl_compositor_destroy(ws.compositor);
-    wl_registry_destroy(ws.registry);
-    wl_display_disconnect(ws.display);
-
-    SL_INFO("Clipboard Manager exited cleanly");
-    return EXIT_SUCCESS;
+    egl_shutdown();
+    wayland_shutdown();
+    return 0;
 }

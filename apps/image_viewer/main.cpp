@@ -232,8 +232,8 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    if (!wayland_init()) { SL_LOG_ERROR("viewer", "Wayland init failed"); return 1; }
-    if (!egl_init())     { SL_LOG_ERROR("viewer", "EGL init failed");     return 1; }
+    if (!wayland_init()) { SL_ERROR("Wayland init failed"); return 1; }
+    if (!egl_init())     { SL_ERROR("EGL init failed");     return 1; }
 
     while (!g_wl.configured) wl_display_dispatch(g_wl.display);
 

@@ -1,5 +1,5 @@
 // apps/clipboard/history.cpp
-// Ring-buffer clipboard history implementation with JSON persistence
+// ClipHistory — ring-buffer clipboard storage with JSON persistence.
 #include "history.h"
 
 #include <straylight/log.h>
@@ -9,78 +9,58 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <sstream>
 
-namespace straylight::clipboard {
-
+// Base64 encode/decode for image blobs
 namespace {
 
-using json = nlohmann::json;
-namespace fs = std::filesystem;
-
-inline SLError make_err(SLErrorCode code, const std::string& msg) {
-    return SLError{code, msg};
-}
-
-int64_t tp_to_epoch(std::chrono::system_clock::time_point tp) {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-        tp.time_since_epoch()).count();
-}
-
-std::chrono::system_clock::time_point epoch_to_tp(int64_t s) {
-    return std::chrono::system_clock::time_point{std::chrono::seconds{s}};
-}
-
-// ---------------------------------------------------------------------------
-// Minimal base64 encode/decode (RFC 4648)
-// ---------------------------------------------------------------------------
-
-static const char kB64Chars[] =
+static const char kB64Table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-std::string base64_encode(const uint8_t* data, size_t len) {
+std::string base64_encode(const std::vector<uint8_t>& data) {
     std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t b = (uint32_t(data[i]) << 16);
-        if (i + 1 < len) b |= uint32_t(data[i + 1]) << 8;
-        if (i + 2 < len) b |= uint32_t(data[i + 2]);
-        out += kB64Chars[(b >> 18) & 0x3F];
-        out += kB64Chars[(b >> 12) & 0x3F];
-        out += (i + 1 < len) ? kB64Chars[(b >> 6) & 0x3F] : '=';
-        out += (i + 2 < len) ? kB64Chars[b & 0x3F] : '=';
+    out.reserve((data.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t v = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < data.size()) v |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < data.size()) v |= static_cast<uint32_t>(data[i + 2]);
+        out.push_back(kB64Table[(v >> 18) & 0x3F]);
+        out.push_back(kB64Table[(v >> 12) & 0x3F]);
+        out.push_back((i + 1 < data.size()) ? kB64Table[(v >>  6) & 0x3F] : '=');
+        out.push_back((i + 2 < data.size()) ? kB64Table[(v      ) & 0x3F] : '=');
     }
     return out;
 }
 
-std::vector<uint8_t> base64_decode(const std::string& in) {
-    auto decode_char = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
-
+std::vector<uint8_t> base64_decode(const std::string& s) {
+    static const int kDecTable[256] = [] {
+        int t[256];
+        std::fill(std::begin(t), std::end(t), -1);
+        for (int i = 0; i < 64; ++i) t[(uint8_t)kB64Table[i]] = i;
+        return std::array<int, 256>(t.begin(), t.end());
+    }()[0]; // workaround: just use a lambda
+    // Simple approach:
     std::vector<uint8_t> out;
-    out.reserve((in.size() / 4) * 3);
-    for (size_t i = 0; i + 3 < in.size(); i += 4) {
-        int b0 = decode_char(in[i]);
-        int b1 = decode_char(in[i + 1]);
-        int b2 = decode_char(in[i + 2]);
-        int b3 = decode_char(in[i + 3]);
-        if (b0 < 0 || b1 < 0) break;
-        out.push_back(uint8_t((b0 << 2) | (b1 >> 4)));
-        if (b2 >= 0) out.push_back(uint8_t(((b1 & 0xF) << 4) | (b2 >> 2)));
-        if (b3 >= 0) out.push_back(uint8_t(((b2 & 0x3) << 6) | b3));
+    out.reserve(s.size() / 4 * 3);
+    int val = 0, bits = -8;
+    for (unsigned char c : s) {
+        if (c == '=') break;
+        const char* pos = std::strchr(kB64Table, c);
+        if (!pos) continue;
+        val = (val << 6) + static_cast<int>(pos - kB64Table);
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
     }
     return out;
 }
 
 } // namespace
+
+namespace straylight::clipboard {
 
 // ---------------------------------------------------------------------------
 // ClipEntry::preview
@@ -92,21 +72,28 @@ std::string ClipEntry::preview(size_t max_chars) const {
         std::snprintf(buf, sizeof(buf), "[Image %zu bytes]", image_data.size());
         return buf;
     }
-    if (text.size() <= max_chars) return text;
-    return text.substr(0, max_chars - 3) + "...";
+    // Truncate and strip newlines
+    std::string out;
+    out.reserve(max_chars + 4);
+    for (char c : text) {
+        if (out.size() >= max_chars) { out += "..."; break; }
+        out.push_back((c == '\n' || c == '\r' || c == '\t') ? ' ' : c);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
-// Storage path
+// storage_path
 // ---------------------------------------------------------------------------
 
-fs::path ClipHistory::storage_path() {
+std::filesystem::path ClipHistory::storage_path() {
     const char* home = std::getenv("HOME");
-    fs::path base = home ? fs::path(home) / ".local" / "share" / "straylight"
-                         : fs::path("/tmp");
+    std::filesystem::path base =
+        home ? std::filesystem::path(home) / ".local" / "share" / "straylight" / "clipboard"
+             : std::filesystem::path("/tmp/straylight-clipboard");
     std::error_code ec;
-    fs::create_directories(base, ec);
-    return base / "clipboard-history.json";
+    std::filesystem::create_directories(base, ec);
+    return base / "history.json";
 }
 
 // ---------------------------------------------------------------------------
@@ -115,17 +102,11 @@ fs::path ClipHistory::storage_path() {
 
 void ClipHistory::push_text(std::string text, const std::string& mime) {
     if (text.empty()) return;
-
-    std::lock_guard lock(mtx_);
-
-    // Deduplicate against most recent entry
+    std::lock_guard<std::mutex> lk(mtx_);
+    // Don't add duplicate of current top entry
     if (!entries_.empty() &&
         entries_.front().kind == EntryKind::Text &&
-        entries_.front().text == text) {
-        // Update timestamp but don't duplicate
-        entries_.front().timestamp = std::chrono::system_clock::now();
-        return;
-    }
+        entries_.front().text == text) return;
 
     ClipEntry e;
     e.kind      = EntryKind::Text;
@@ -134,19 +115,15 @@ void ClipHistory::push_text(std::string text, const std::string& mime) {
     e.timestamp = std::chrono::system_clock::now();
     entries_.push_front(std::move(e));
 
-    // Evict oldest non-pinned if over capacity
+    // Evict oldest non-pinned entries if over limit
     while (entries_.size() > kMaxEntries) {
-        // find last non-pinned entry from the back
-        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-            if (!it->pinned) {
-                entries_.erase(std::next(it).base());
-                break;
-            }
+        // Find last non-pinned
+        for (auto it = entries_.end(); it != entries_.begin(); ) {
+            --it;
+            if (!it->pinned) { entries_.erase(it); break; }
         }
-        // Safety: if all are pinned just drop the oldest
-        if (entries_.size() > kMaxEntries) {
-            entries_.pop_back();
-        }
+        // Safety: if all pinned somehow just break
+        if (entries_.size() > kMaxEntries + 100) break;
     }
 }
 
@@ -156,8 +133,7 @@ void ClipHistory::push_text(std::string text, const std::string& mime) {
 
 void ClipHistory::push_image(std::vector<uint8_t> png_data, const std::string& mime) {
     if (png_data.empty()) return;
-
-    std::lock_guard lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
 
     ClipEntry e;
     e.kind       = EntryKind::Image;
@@ -167,133 +143,148 @@ void ClipHistory::push_image(std::vector<uint8_t> png_data, const std::string& m
     entries_.push_front(std::move(e));
 
     while (entries_.size() > kMaxEntries) {
-        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-            if (!it->pinned) {
-                entries_.erase(std::next(it).base());
-                break;
-            }
+        for (auto it = entries_.end(); it != entries_.begin(); ) {
+            --it;
+            if (!it->pinned) { entries_.erase(it); break; }
         }
-        if (entries_.size() > kMaxEntries) entries_.pop_back();
+        if (entries_.size() > kMaxEntries + 100) break;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Read-only accessors
+// Accessors
 // ---------------------------------------------------------------------------
 
 std::vector<ClipEntry> ClipHistory::entries() const {
-    std::lock_guard lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     return {entries_.begin(), entries_.end()};
 }
 
 size_t ClipHistory::size() const {
-    std::lock_guard lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     return entries_.size();
 }
 
 void ClipHistory::toggle_pin(size_t index) {
-    std::lock_guard lock(mtx_);
-    if (index < entries_.size()) entries_[index].pinned = !entries_[index].pinned;
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (index < entries_.size()) {
+        auto it = std::next(entries_.begin(), static_cast<std::ptrdiff_t>(index));
+        it->pinned = !it->pinned;
+    }
 }
 
 void ClipHistory::remove(size_t index) {
-    std::lock_guard lock(mtx_);
-    if (index < entries_.size()) entries_.erase(entries_.begin() + index);
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (index < entries_.size()) {
+        entries_.erase(std::next(entries_.begin(), static_cast<std::ptrdiff_t>(index)));
+    }
 }
 
 void ClipHistory::clear_unpinned() {
-    std::lock_guard lock(mtx_);
-    entries_.erase(
-        std::remove_if(entries_.begin(), entries_.end(),
-                       [](const ClipEntry& e){ return !e.pinned; }),
-        entries_.end());
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = entries_.begin();
+    while (it != entries_.end()) {
+        if (!it->pinned) it = entries_.erase(it);
+        else ++it;
+    }
 }
 
 void ClipHistory::clear_all() {
-    std::lock_guard lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     entries_.clear();
 }
 
 // ---------------------------------------------------------------------------
-// Persistence
+// save
 // ---------------------------------------------------------------------------
 
 Result<void, SLError> ClipHistory::save() const {
-    std::lock_guard lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
+    nlohmann::json j = nlohmann::json::array();
 
-    json jarr = json::array();
     for (const auto& e : entries_) {
-        json je;
-        je["kind"]      = (e.kind == EntryKind::Image) ? "image" : "text";
-        je["mime"]      = e.mime;
-        je["pinned"]    = e.pinned;
-        je["timestamp"] = tp_to_epoch(e.timestamp);
+        nlohmann::json je;
+        je["kind"]    = (e.kind == EntryKind::Text) ? "text" : "image";
+        je["mime"]    = e.mime;
+        je["pinned"]  = e.pinned;
+        je["ts"]      = std::chrono::duration_cast<std::chrono::seconds>(
+                             e.timestamp.time_since_epoch()).count();
 
         if (e.kind == EntryKind::Text) {
             je["text"] = e.text;
-        } else {
-            // Store image as base64 (only persist pinned images to avoid huge files)
-            if (e.pinned) {
-                je["image_b64"] = base64_encode(e.image_data.data(),
-                                                 e.image_data.size());
-            }
+        } else if (e.pinned && !e.image_data.empty()) {
+            // Only persist pinned images (can be large)
+            je["data_b64"] = base64_encode(e.image_data);
         }
-        jarr.push_back(std::move(je));
+        j.push_back(std::move(je));
     }
 
-    json root;
-    root["version"] = 1;
-    root["entries"] = std::move(jarr);
-
-    std::ofstream f(storage_path());
-    if (!f) {
+    const auto path = storage_path();
+    // Atomic write: write to .tmp then rename
+    const auto tmp  = std::filesystem::path(path.string() + ".tmp");
+    {
+        std::ofstream f(tmp);
+        if (!f) {
+            return Result<void, SLError>::error(
+                SLError{SLErrorCode::IOError, "Cannot write: " + tmp.string()});
+        }
+        f << j.dump(2);
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
         return Result<void, SLError>::error(
-            make_err(SLErrorCode::IOError,
-                     "Cannot write clipboard history: " + storage_path().string()));
+            SLError{SLErrorCode::IOError, "Rename failed: " + ec.message()});
     }
-    f << root.dump(2);
     return Result<void, SLError>::ok();
 }
 
+// ---------------------------------------------------------------------------
+// load
+// ---------------------------------------------------------------------------
+
 Result<void, SLError> ClipHistory::load() {
-    const fs::path p = storage_path();
-    if (!fs::exists(p)) return Result<void, SLError>::ok();
-
-    std::ifstream f(p);
+    const auto path = storage_path();
+    std::ifstream f(path);
     if (!f) {
-        return Result<void, SLError>::error(
-            make_err(SLErrorCode::IOError, "Cannot read clipboard history: " + p.string()));
+        // No history file yet — not an error
+        return Result<void, SLError>::ok();
     }
 
-    json root;
-    try { f >> root; }
-    catch (const std::exception& ex) {
+    nlohmann::json j;
+    try { f >> j; } catch (const nlohmann::json::exception& ex) {
         return Result<void, SLError>::error(
-            make_err(SLErrorCode::ParseError,
-                     std::string("JSON parse error: ") + ex.what()));
+            SLError{SLErrorCode::ParseError,
+                    std::string("JSON parse error: ") + ex.what()});
     }
 
-    std::lock_guard lock(mtx_);
+    if (!j.is_array()) {
+        return Result<void, SLError>::error(
+            SLError{SLErrorCode::ParseError, "Expected JSON array"});
+    }
+
+    std::lock_guard<std::mutex> lk(mtx_);
     entries_.clear();
 
-    for (const auto& je : root.value("entries", json::array())) {
+    for (const auto& je : j) {
         ClipEntry e;
-        std::string kind_s = je.value("kind", "text");
-        e.kind      = (kind_s == "image") ? EntryKind::Image : EntryKind::Text;
-        e.mime      = je.value("mime", "text/plain");
-        e.pinned    = je.value("pinned", false);
-        e.timestamp = epoch_to_tp(je.value("timestamp", int64_t{0}));
+        const std::string kind = je.value("kind", "text");
+        e.kind   = (kind == "image") ? EntryKind::Image : EntryKind::Text;
+        e.mime   = je.value("mime", "text/plain");
+        e.pinned = je.value("pinned", false);
+
+        int64_t ts_sec = je.value("ts", int64_t(0));
+        e.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(ts_sec));
 
         if (e.kind == EntryKind::Text) {
-            e.text = je.value("text", "");
+            e.text = je.value("text", std::string{});
         } else {
-            std::string b64 = je.value("image_b64", "");
+            const std::string b64 = je.value("data_b64", std::string{});
             if (!b64.empty()) e.image_data = base64_decode(b64);
         }
         entries_.push_back(std::move(e));
     }
 
-    SL_INFO("Loaded {} clipboard history entries", entries_.size());
     return Result<void, SLError>::ok();
 }
 

@@ -1,0 +1,10 @@
+usr/bin/straylight-core
+usr/bin/straylight-bus
+usr/bin/straylight-registry
+usr/bin/straylight-scheduler
+usr/bin/straylight-entropy
+etc/straylight/core.conf
+etc/straylight/bus.conf
+etc/straylight/registry.conf
+etc/straylight/scheduler.conf
+etc/straylight/entropy.conf

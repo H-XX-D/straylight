@@ -1,0 +1,11 @@
+straylight-desktop (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Wayland compositor based on wlroots 0.18
+  * ImGui desktop shell with layer-shell panels
+  * Built-in apps: terminal, file manager, system monitor, settings
+  * Wizard (personalization), OOBE (first-login setup), greeter (login)
+  * Themes: default, cyberpunk, minimal
+  * Calamares installer modules for hardware detection
+
+ -- StrayLight OS Team <dev@straylight.dev>  Sun, 16 Mar 2026 00:00:00 +0000

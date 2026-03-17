@@ -6,9 +6,6 @@
 
 #include <stb_image.h>
 
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include <stb_image_resize2.h>
-
 #include <algorithm>
 #include <cmath>
 
@@ -134,10 +131,31 @@ void ThumbnailGrid::generate(size_t index) {
     }
 
     std::vector<uint8_t> thumb(tw * th * 4);
-    stbir_resize_uint8_srgb(data, w, h, w * 4,
-                             thumb.data(), static_cast<int>(tw),
-                             static_cast<int>(th), static_cast<int>(tw) * 4,
-                             STBIR_RGBA);
+    // Box-filter downsample
+    const float sx = static_cast<float>(w)  / static_cast<float>(tw);
+    const float sy = static_cast<float>(h)  / static_cast<float>(th);
+    for (uint32_t dy = 0; dy < th; ++dy) {
+        for (uint32_t dx = 0; dx < tw; ++dx) {
+            const int x0 = static_cast<int>(static_cast<float>(dx) * sx);
+            const int y0 = static_cast<int>(static_cast<float>(dy) * sy);
+            const int x1 = std::min(w - 1, static_cast<int>((static_cast<float>(dx) + 1.f) * sx));
+            const int y1 = std::min(h - 1, static_cast<int>((static_cast<float>(dy) + 1.f) * sy));
+            uint32_t sum[4] = {};
+            int cnt = 0;
+            for (int sy2 = y0; sy2 <= y1; ++sy2) {
+                for (int sx2 = x0; sx2 <= x1; ++sx2) {
+                    const uint8_t* px = data + (sy2 * w + sx2) * 4;
+                    sum[0] += px[0]; sum[1] += px[1]; sum[2] += px[2]; sum[3] += px[3];
+                    ++cnt;
+                }
+            }
+            if (cnt > 0) {
+                uint8_t* out = thumb.data() + (dy * tw + dx) * 4;
+                for (int c = 0; c < 4; ++c)
+                    out[c] = static_cast<uint8_t>(sum[c] / static_cast<uint32_t>(cnt));
+            }
+        }
+    }
     stbi_image_free(data);
 
     GLuint tex = 0;

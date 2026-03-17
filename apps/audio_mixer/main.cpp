@@ -1,8 +1,7 @@
 // apps/audio_mixer/main.cpp
-// StrayLight Audio Mixer — Wayland + EGL + ImGui
-// Per-app volume sliders, peak meters, output device selector.
-#include "pipewire_client.h"
+// StrayLight Audio Mixer — Wayland + EGL + ImGui PipeWire mixer UI
 #include "mixer.h"
+#include "pipewire_client.h"
 
 #include <straylight/log.h>
 
@@ -11,484 +10,450 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <wayland-egl.h>
-#include <imgui.h>
-#include <imgui_impl_opengl3.h>
 #include <xdg-shell-client-protocol.h>
 
+#include <imgui.h>
+#include <imgui_impl_opengl3.h>
+
+#include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <unistd.h>
+#include <string>
+#include <vector>
+
+using namespace straylight;
+using namespace straylight::mixer;
 
 namespace {
-
-using namespace straylight::mixer;
 
 std::atomic<bool> g_running{true};
 void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
 
 // ---------------------------------------------------------------------------
-// Wayland boilerplate
+// Wayland / EGL boilerplate
 // ---------------------------------------------------------------------------
 
 struct WaylandState {
-    wl_display*    display          = nullptr;
-    wl_registry*   registry         = nullptr;
-    wl_compositor* compositor       = nullptr;
-    wl_seat*       seat             = nullptr;
-    xdg_wm_base*   xdg_wm_base_ptr = nullptr;
-    wl_surface*    surface          = nullptr;
-    xdg_surface*   xdg_surface_ptr  = nullptr;
-    xdg_toplevel*  toplevel         = nullptr;
-    wl_egl_window* egl_window       = nullptr;
-    int  width = 800, height = 500;
-    bool configured = false, needs_resize = false;
+    wl_display*    display    = nullptr;
+    wl_registry*   registry   = nullptr;
+    wl_compositor* compositor = nullptr;
+    wl_seat*       seat       = nullptr;
+    wl_pointer*    pointer    = nullptr;
+    wl_keyboard*   keyboard   = nullptr;
+    xdg_wm_base*   xdg_wm    = nullptr;
+    wl_surface*    surface    = nullptr;
+    xdg_surface*   xdg_surf  = nullptr;
+    xdg_toplevel*  toplevel  = nullptr;
+
+    int   width      = 700;
+    int   height     = 480;
+    bool  configured = false;
+    float mouse_x = 0.0f, mouse_y = 0.0f;
+    bool  mouse_buttons[5] = {};
 };
 
-void reg_global(void* data, wl_registry* reg, uint32_t name,
-                const char* iface, uint32_t ver);
-void reg_global_remove(void*, wl_registry*, uint32_t) {}
-const wl_registry_listener reg_listener = {
-    .global        = reg_global,
-    .global_remove = reg_global_remove,
+WaylandState g_wl;
+
+static const wl_pointer_listener ptr_l = {
+    [](void*, wl_pointer*, uint32_t, wl_surface*, wl_fixed_t x, wl_fixed_t y) {
+        g_wl.mouse_x = wl_fixed_to_double(x); g_wl.mouse_y = wl_fixed_to_double(y);
+    },
+    [](void*, wl_pointer*, uint32_t, wl_surface*) {},
+    [](void*, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y) {
+        g_wl.mouse_x = wl_fixed_to_double(x); g_wl.mouse_y = wl_fixed_to_double(y);
+    },
+    [](void*, wl_pointer*, uint32_t, uint32_t, uint32_t btn, uint32_t s) {
+        int i = (btn==272)?0:(btn==273)?1:(btn==274)?2:-1;
+        if (i>=0) g_wl.mouse_buttons[i] = (s==1);
+    },
+    [](void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t v) {
+        ImGui::GetIO().MouseWheel -= wl_fixed_to_double(v) / 10.0;
+    },
+    nullptr,nullptr,nullptr,nullptr,nullptr,
 };
-void wm_ping(void*, xdg_wm_base* b, uint32_t s) { xdg_wm_base_pong(b, s); }
-const xdg_wm_base_listener wm_listener = { .ping = wm_ping };
-void surf_configure(void* d, xdg_surface* s, uint32_t serial) {
-    xdg_surface_ack_configure(s, serial);
-    static_cast<WaylandState*>(d)->configured = true;
+
+static const wl_keyboard_listener kbd_l = {
+    [](void*,wl_keyboard*,uint32_t,int32_t,uint32_t){},
+    [](void*,wl_keyboard*,uint32_t,wl_surface*,wl_array*){},
+    [](void*,wl_keyboard*,uint32_t,wl_surface*){},
+    [](void*,wl_keyboard*,uint32_t,uint32_t,uint32_t,uint32_t){},
+    [](void*,wl_keyboard*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){},
+    nullptr,
+};
+
+static const wl_seat_listener seat_l = {
+    [](void*, wl_seat* s, uint32_t caps) {
+        if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g_wl.pointer) {
+            g_wl.pointer = wl_seat_get_pointer(s);
+            wl_pointer_add_listener(g_wl.pointer, &ptr_l, nullptr);
+        }
+        if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !g_wl.keyboard) {
+            g_wl.keyboard = wl_seat_get_keyboard(s);
+            wl_keyboard_add_listener(g_wl.keyboard, &kbd_l, nullptr);
+        }
+    },
+    [](void*,wl_seat*,const char*){},
+};
+
+static const xdg_surface_listener xdg_surf_l = {
+    [](void*, xdg_surface* xs, uint32_t serial) {
+        xdg_surface_ack_configure(xs, serial); g_wl.configured = true;
+    },
+};
+
+static const xdg_toplevel_listener toplevel_l = {
+    [](void*, xdg_toplevel*, int32_t w, int32_t h, wl_array*) {
+        if (w>0&&h>0){g_wl.width=w;g_wl.height=h;}
+    },
+    [](void*, xdg_toplevel*) { g_running.store(false, std::memory_order_relaxed); },
+    nullptr, nullptr,
+};
+
+static const xdg_wm_base_listener wm_l = {
+    [](void*, xdg_wm_base* wm, uint32_t s){ xdg_wm_base_pong(wm,s); },
+};
+
+static const wl_registry_listener reg_l = {
+    [](void*, wl_registry* reg, uint32_t name, const char* iface, uint32_t ver) {
+        if (!std::strcmp(iface, wl_compositor_interface.name))
+            g_wl.compositor = static_cast<wl_compositor*>(
+                wl_registry_bind(reg, name, &wl_compositor_interface, 4));
+        else if (!std::strcmp(iface, xdg_wm_base_interface.name)) {
+            g_wl.xdg_wm = static_cast<xdg_wm_base*>(
+                wl_registry_bind(reg, name, &xdg_wm_base_interface, 1));
+            xdg_wm_base_add_listener(g_wl.xdg_wm, &wm_l, nullptr);
+        } else if (!std::strcmp(iface, wl_seat_interface.name)) {
+            g_wl.seat = static_cast<wl_seat*>(
+                wl_registry_bind(reg, name, &wl_seat_interface, std::min(ver, 5u)));
+            wl_seat_add_listener(g_wl.seat, &seat_l, nullptr);
+        }
+    },
+    [](void*, wl_registry*, uint32_t){},
+};
+
+struct EGLState {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+    wl_egl_window* window = nullptr;
+};
+EGLState g_egl;
+
+bool egl_init() {
+    g_egl.display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_EXT, g_wl.display, nullptr);
+    if (g_egl.display == EGL_NO_DISPLAY) return false;
+    EGLint major=0,minor=0;
+    if (!eglInitialize(g_egl.display,&major,&minor)) return false;
+    eglBindAPI(EGL_OPENGL_ES_API);
+    const EGLint ca[] = {
+        EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,
+        EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE
+    };
+    EGLConfig cfg=nullptr; EGLint nc=0;
+    if (!eglChooseConfig(g_egl.display,ca,&cfg,1,&nc)||nc<1) return false;
+    const EGLint cxa[]={EGL_CONTEXT_MAJOR_VERSION,3,EGL_NONE};
+    g_egl.context = eglCreateContext(g_egl.display,cfg,EGL_NO_CONTEXT,cxa);
+    if (g_egl.context==EGL_NO_CONTEXT) return false;
+    g_egl.window  = wl_egl_window_create(g_wl.surface, g_wl.width, g_wl.height);
+    g_egl.surface = eglCreateWindowSurface(g_egl.display,cfg,
+        reinterpret_cast<EGLNativeWindowType>(g_egl.window), nullptr);
+    return eglMakeCurrent(g_egl.display,g_egl.surface,g_egl.surface,g_egl.context);
 }
-const xdg_surface_listener surf_listener = { .configure = surf_configure };
-void tl_configure(void* d, xdg_toplevel*, int32_t w, int32_t h, wl_array*) {
-    auto* ws = static_cast<WaylandState*>(d);
-    if (w > 0 && h > 0 && (w != ws->width || h != ws->height)) {
-        ws->width = w; ws->height = h; ws->needs_resize = true;
+
+void egl_shutdown() {
+    if (g_egl.display!=EGL_NO_DISPLAY) {
+        eglMakeCurrent(g_egl.display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
+        if (g_egl.surface!=EGL_NO_SURFACE) eglDestroySurface(g_egl.display,g_egl.surface);
+        if (g_egl.context!=EGL_NO_CONTEXT) eglDestroyContext(g_egl.display,g_egl.context);
+        eglTerminate(g_egl.display);
     }
-}
-void tl_close(void*, xdg_toplevel*) { g_running.store(false, std::memory_order_relaxed); }
-void tl_bounds(void*, xdg_toplevel*, int32_t, int32_t) {}
-void tl_caps(void*, xdg_toplevel*, wl_array*) {}
-const xdg_toplevel_listener tl_listener = {
-    .configure        = tl_configure,
-    .close            = tl_close,
-    .configure_bounds = tl_bounds,
-    .wm_capabilities  = tl_caps,
-};
-void seat_caps(void*, wl_seat*, uint32_t) {}
-void seat_name(void*, wl_seat*, const char*) {}
-const wl_seat_listener seat_listener = { .capabilities = seat_caps, .name = seat_name };
-
-void reg_global(void* data, wl_registry* reg, uint32_t name,
-                const char* iface, uint32_t ver) {
-    auto* ws = static_cast<WaylandState*>(data);
-    if (std::strcmp(iface, wl_compositor_interface.name) == 0)
-        ws->compositor = static_cast<wl_compositor*>(
-            wl_registry_bind(reg, name, &wl_compositor_interface, std::min(ver, 4u)));
-    else if (std::strcmp(iface, xdg_wm_base_interface.name) == 0) {
-        ws->xdg_wm_base_ptr = static_cast<xdg_wm_base*>(
-            wl_registry_bind(reg, name, &xdg_wm_base_interface, std::min(ver, 2u)));
-        xdg_wm_base_add_listener(ws->xdg_wm_base_ptr, &wm_listener, ws);
-    } else if (std::strcmp(iface, wl_seat_interface.name) == 0) {
-        ws->seat = static_cast<wl_seat*>(
-            wl_registry_bind(reg, name, &wl_seat_interface, std::min(ver, 5u)));
-        wl_seat_add_listener(ws->seat, &seat_listener, ws);
-    }
+    if (g_egl.window) wl_egl_window_destroy(g_egl.window);
 }
 
-// ---------------------------------------------------------------------------
-// Theme
-// ---------------------------------------------------------------------------
+bool wayland_init() {
+    g_wl.display = wl_display_connect(nullptr);
+    if (!g_wl.display) return false;
+    g_wl.registry = wl_display_get_registry(g_wl.display);
+    wl_registry_add_listener(g_wl.registry, &reg_l, nullptr);
+    wl_display_roundtrip(g_wl.display);
+    if (!g_wl.compositor || !g_wl.xdg_wm) return false;
+    g_wl.surface  = wl_compositor_create_surface(g_wl.compositor);
+    g_wl.xdg_surf = xdg_wm_base_get_xdg_surface(g_wl.xdg_wm, g_wl.surface);
+    xdg_surface_add_listener(g_wl.xdg_surf, &xdg_surf_l, nullptr);
+    g_wl.toplevel = xdg_surface_get_toplevel(g_wl.xdg_surf);
+    xdg_toplevel_add_listener(g_wl.toplevel, &toplevel_l, nullptr);
+    xdg_toplevel_set_title(g_wl.toplevel,  "StrayLight Audio Mixer");
+    xdg_toplevel_set_app_id(g_wl.toplevel, "straylight.audiomixer");
+    wl_surface_commit(g_wl.surface);
+    wl_display_roundtrip(g_wl.display);
+    return true;
+}
 
-void apply_theme() {
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 0.0f; s.FrameRounding = 3.0f;
-    s.ItemSpacing = ImVec2(8.0f, 6.0f); s.FramePadding = ImVec2(6.0f, 4.0f);
-    s.WindowPadding = ImVec2(12.0f, 12.0f);
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]          = ImVec4(0.08f, 0.08f, 0.13f, 1.0f);
-    c[ImGuiCol_ChildBg]           = ImVec4(0.10f, 0.10f, 0.16f, 1.0f);
-    c[ImGuiCol_FrameBg]           = ImVec4(0.14f, 0.14f, 0.22f, 1.0f);
-    c[ImGuiCol_FrameBgHovered]    = ImVec4(0.20f, 0.20f, 0.30f, 1.0f);
-    c[ImGuiCol_Button]            = ImVec4(0.0f,  0.55f, 0.38f, 0.8f);
-    c[ImGuiCol_ButtonHovered]     = ImVec4(0.0f,  0.80f, 0.55f, 1.0f);
-    c[ImGuiCol_ButtonActive]      = ImVec4(0.0f,  1.00f, 0.67f, 1.0f);
-    c[ImGuiCol_SliderGrab]        = ImVec4(0.0f,  0.80f, 0.55f, 1.0f);
-    c[ImGuiCol_SliderGrabActive]  = ImVec4(0.0f,  1.00f, 0.67f, 1.0f);
-    c[ImGuiCol_Header]            = ImVec4(0.0f,  0.55f, 0.38f, 0.6f);
-    c[ImGuiCol_HeaderHovered]     = ImVec4(0.0f,  0.80f, 0.55f, 0.8f);
-    c[ImGuiCol_HeaderActive]      = ImVec4(0.0f,  1.00f, 0.67f, 1.0f);
-    c[ImGuiCol_Separator]         = ImVec4(0.20f, 0.20f, 0.32f, 1.0f);
-    c[ImGuiCol_Border]            = ImVec4(0.20f, 0.20f, 0.32f, 1.0f);
-    c[ImGuiCol_Text]              = ImVec4(0.90f, 0.90f, 0.90f, 1.0f);
-    c[ImGuiCol_TextDisabled]      = ImVec4(0.50f, 0.50f, 0.50f, 1.0f);
-    c[ImGuiCol_PlotHistogram]     = ImVec4(0.0f,  0.80f, 0.55f, 1.0f);
-    c[ImGuiCol_PlotHistogramHovered] = ImVec4(0.0f, 1.0f, 0.67f, 1.0f);
+void wayland_shutdown() {
+    if (g_wl.toplevel)   xdg_toplevel_destroy(g_wl.toplevel);
+    if (g_wl.xdg_surf)   xdg_surface_destroy(g_wl.xdg_surf);
+    if (g_wl.surface)    wl_surface_destroy(g_wl.surface);
+    if (g_wl.pointer)    wl_pointer_destroy(g_wl.pointer);
+    if (g_wl.keyboard)   wl_keyboard_destroy(g_wl.keyboard);
+    if (g_wl.seat)       wl_seat_destroy(g_wl.seat);
+    if (g_wl.xdg_wm)    xdg_wm_base_destroy(g_wl.xdg_wm);
+    if (g_wl.compositor) wl_compositor_destroy(g_wl.compositor);
+    if (g_wl.registry)   wl_registry_destroy(g_wl.registry);
+    if (g_wl.display)    wl_display_disconnect(g_wl.display);
 }
 
 // ---------------------------------------------------------------------------
-// Draw a vertical peak meter for one channel
+// Draw a vertical slider + peak meter for one audio node
 // ---------------------------------------------------------------------------
 
-void draw_peak_meter(const PeakSample& m, float width, float height) {
-    ImVec2 pos  = ImGui::GetCursorScreenPos();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Background
-    dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height),
-                      IM_COL32(20, 20, 35, 255));
-
-    // RMS bar (green -> yellow -> red gradient based on level)
-    float rms_h = m.rms * height;
-    ImU32 rms_col = IM_COL32(0, 200, 130, 220);
-    if (m.rms > 0.85f) rms_col = IM_COL32(255, 60, 60, 220);
-    else if (m.rms > 0.7f) rms_col = IM_COL32(255, 200, 0, 220);
-
-    dl->AddRectFilled(
-        ImVec2(pos.x, pos.y + height - rms_h),
-        ImVec2(pos.x + width, pos.y + height),
-        rms_col);
-
-    // Peak hold line
-    float peak_y = pos.y + height - m.peak * height;
-    dl->AddLine(ImVec2(pos.x, peak_y),
-                ImVec2(pos.x + width, peak_y),
-                IM_COL32(255, 255, 255, 180), 1.5f);
-
-    // Border
-    dl->AddRect(pos, ImVec2(pos.x + width, pos.y + height),
-                IM_COL32(50, 50, 80, 200));
-
-    ImGui::Dummy(ImVec2(width, height));
-}
-
-// ---------------------------------------------------------------------------
-// Draw a single mixer channel strip
-// ---------------------------------------------------------------------------
-
-void draw_channel_strip(Mixer& mixer,
-                         const MixerChannel& ch,
-                         const std::vector<MixerChannel>& sinks) {
-    constexpr float kStripWidth  = 90.0f;
-    constexpr float kMeterWidth  = 10.0f;
-    constexpr float kMeterHeight = 180.0f;
-    constexpr float kSliderHeight = 180.0f;
-
-    ImGui::PushID(static_cast<int>(ch.node.id));
-
+void draw_channel_strip(AudioMixer& mixer, const PwNodeInfo& node,
+                         float strip_w, float strip_h) {
+    ImGui::PushID(static_cast<int>(node.id));
     ImGui::BeginGroup();
 
-    // App label
-    const std::string& lbl = ch.label();
-    std::string short_lbl = lbl.size() > 12 ? lbl.substr(0, 11) + "." : lbl;
-    ImGui::TextUnformatted(short_lbl.c_str());
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", lbl.c_str());
+    const float slider_h  = strip_h - 60.0f;
+    const float meter_w   = 8.0f;
+    const float slider_w  = strip_w - meter_w - 6.0f;
 
-    // Media class badge
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.6f, 1.0f));
-    if (ch.node.is_device()) ImGui::TextUnformatted("[OUT]");
-    else if (ch.node.is_sink_stream()) ImGui::TextUnformatted("[APP]");
-    else ImGui::TextUnformatted("[IN]");
-    ImGui::PopStyleColor();
+    // Peak meter (drawn via draw list)
+    ImVec2 meter_pos = ImGui::GetCursorScreenPos();
+    meter_pos.x += slider_w + 4.0f;
+    const float peak = mixer.get_peak(node.id);
+    ImDrawList* dl   = ImGui::GetWindowDrawList();
+    // Background
+    dl->AddRectFilled(meter_pos,
+                      ImVec2(meter_pos.x + meter_w, meter_pos.y + slider_h),
+                      IM_COL32(20, 20, 30, 220));
+    // Filled level
+    const float filled_h = peak * slider_h;
+    const float fy0      = meter_pos.y + slider_h - filled_h;
+    // Green→yellow→red gradient
+    uint32_t meter_col = (peak < 0.6f) ? IM_COL32(40, 220, 80, 255)
+                       : (peak < 0.85f) ? IM_COL32(220, 200, 30, 255)
+                                        : IM_COL32(220, 40, 40, 255);
+    dl->AddRectFilled(ImVec2(meter_pos.x, fy0),
+                      ImVec2(meter_pos.x + meter_w, meter_pos.y + slider_h),
+                      meter_col);
 
-    ImGui::Spacing();
+    // Vertical volume slider
+    float vol = mixer.get_volume(node.id);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab,     ImVec4(0.80f, 0.10f, 0.90f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.10f, 0.10f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.16f, 0.16f, 0.22f, 1.0f));
+    if (ImGui::VSliderFloat("##vol", ImVec2(slider_w, slider_h), &vol, 0.0f, 1.0f, "")) {
+        mixer.set_volume(node.id, vol);
+    }
+    ImGui::PopStyleColor(3);
 
-    // Peak meters (one per channel, horizontal row)
-    size_t n_ch = std::max(ch.meters.size(), size_t(1));
-    float meter_row_w = float(n_ch) * (kMeterWidth + 2.0f);
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                          (kStripWidth - meter_row_w) * 0.5f);
-    for (size_t i = 0; i < n_ch; ++i) {
-        if (i < ch.meters.size())
-            draw_peak_meter(ch.meters[i], kMeterWidth, kMeterHeight);
-        else
-            draw_peak_meter(PeakSample{}, kMeterWidth, kMeterHeight);
-        if (i + 1 < n_ch) ImGui::SameLine(0.0f, 2.0f);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%.0f%%", vol * 100.0f);
     }
 
     ImGui::Spacing();
-
-    // Volume slider (vertical)
-    float vol = ch.master_volume();
-    char vol_id[32];
-    std::snprintf(vol_id, sizeof(vol_id), "##vol%u", ch.node.id);
-    ImGui::SetNextItemWidth(kStripWidth - 10.0f);
-    if (ImGui::SliderFloat(vol_id, &vol, 0.0f, 1.0f, "%.2f",
-                            ImGuiSliderFlags_None)) {
-        mixer.set_master_volume(ch.node.id, vol);
-    }
-
-    // dB label
-    char db_buf[16];
-    std::snprintf(db_buf, sizeof(db_buf), "%.1f dB", Mixer::to_db(vol));
-    ImGui::TextDisabled("%s", db_buf);
 
     // Mute button
-    bool muted = ch.node.muted;
-    if (muted) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
-    if (ImGui::Button(muted ? "MUTED##m" : "Mute##m", ImVec2(kStripWidth - 10.0f, 0.0f))) {
-        mixer.toggle_mute(ch.node.id);
+    bool muted = mixer.get_muted(node.id);
+    if (muted)
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.05f, 0.05f, 1.0f));
+    if (ImGui::Button(muted ? "M##mute" : " ##mute", ImVec2(strip_w, 20))) {
+        mixer.set_mute(node.id, !muted);
     }
     if (muted) ImGui::PopStyleColor();
 
-    // Sink routing dropdown (only for app streams)
-    if (ch.node.is_sink_stream() && !sinks.empty()) {
-        ImGui::Spacing();
-        ImGui::SetNextItemWidth(kStripWidth - 10.0f);
-        char sink_id[32];
-        std::snprintf(sink_id, sizeof(sink_id), "##sink%u", ch.node.id);
-        if (ImGui::BeginCombo(sink_id, "Route...", ImGuiComboFlags_NoArrowButton)) {
-            for (const auto& sink : sinks) {
-                const std::string& slabel = sink.label();
-                if (ImGui::Selectable(slabel.c_str(), false)) {
-                    mixer.route_stream(ch.node.id, sink.node.id);
-                }
-            }
-            ImGui::EndCombo();
-        }
-    }
+    // Volume percentage
+    ImGui::SetNextItemWidth(strip_w);
+    char pct_buf[8];
+    std::snprintf(pct_buf, sizeof(pct_buf), "%.0f%%", vol * 100.0f);
+    ImGui::TextUnformatted(pct_buf);
+
+    // Application name (truncated)
+    const std::string& label_src = node.nick.empty() ? node.name : node.nick;
+    const std::string  label = label_src.size() > 9
+        ? label_src.substr(0, 7) + ".."
+        : label_src;
+    ImGui::TextUnformatted(label.c_str());
 
     ImGui::EndGroup();
     ImGui::PopID();
 }
 
-} // anonymous namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
-// main()
+// main
 // ---------------------------------------------------------------------------
 
-int main(int /*argc*/, char* /*argv*/[]) {
-    using namespace straylight;
-    using namespace straylight::mixer;
-
-    Log::init("straylight-audio-mixer");
-    SL_INFO("StrayLight Audio Mixer starting");
-
-    std::signal(SIGTERM, signal_handler);
+int main(int argc, char* argv[]) {
     std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
 
-    // --- PipeWire ---------------------------------------------------------
-    PipeWireClient pw;
-    Mixer mixer(pw);
+    PipeWireClient::pw_init_once(&argc, &argv);
 
-    (void)pw.start([&mixer]() {
-        mixer.refresh();
-    });
+    if (!wayland_init()) { SL_LOG_ERROR("mixer", "Wayland init failed"); return 1; }
+    if (!egl_init())     { SL_LOG_ERROR("mixer", "EGL init failed");     return 1; }
 
-    // Wait briefly for initial enumeration
-    usleep(200000); // 200 ms
-    mixer.refresh();
+    while (!g_wl.configured) wl_display_dispatch(g_wl.display);
 
-    // --- Wayland ----------------------------------------------------------
-    WaylandState ws;
-    ws.display = wl_display_connect(nullptr);
-    if (!ws.display) {
-        SL_CRITICAL("No Wayland display");
-        pw.stop();
-        return EXIT_FAILURE;
-    }
-    ws.registry = wl_display_get_registry(ws.display);
-    wl_registry_add_listener(ws.registry, &reg_listener, &ws);
-    wl_display_roundtrip(ws.display);
-
-    if (!ws.compositor || !ws.xdg_wm_base_ptr) {
-        SL_CRITICAL("Missing Wayland globals");
-        pw.stop();
-        wl_display_disconnect(ws.display);
-        return EXIT_FAILURE;
-    }
-
-    ws.surface         = wl_compositor_create_surface(ws.compositor);
-    ws.xdg_surface_ptr = xdg_wm_base_get_xdg_surface(ws.xdg_wm_base_ptr, ws.surface);
-    xdg_surface_add_listener(ws.xdg_surface_ptr, &surf_listener, &ws);
-    ws.toplevel = xdg_surface_get_toplevel(ws.xdg_surface_ptr);
-    xdg_toplevel_add_listener(ws.toplevel, &tl_listener, &ws);
-    xdg_toplevel_set_title(ws.toplevel, "StrayLight Audio Mixer");
-    xdg_toplevel_set_app_id(ws.toplevel, "straylight-audio-mixer");
-    xdg_toplevel_set_min_size(ws.toplevel, 600, 420);
-    wl_surface_commit(ws.surface);
-    wl_display_roundtrip(ws.display);
-
-    // --- EGL --------------------------------------------------------------
-    EGLDisplay egl_disp = eglGetDisplay(
-        reinterpret_cast<EGLNativeDisplayType>(ws.display));
-    EGLint major = 0, minor = 0;
-    eglInitialize(egl_disp, &major, &minor);
-    constexpr EGLint cfg_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 24, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE
-    };
-    EGLConfig egl_cfg = nullptr; EGLint num_cfgs = 0;
-    eglChooseConfig(egl_disp, cfg_attribs, &egl_cfg, 1, &num_cfgs);
-    ws.egl_window = wl_egl_window_create(ws.surface, ws.width, ws.height);
-    EGLSurface egl_surf = eglCreateWindowSurface(egl_disp, egl_cfg,
-        reinterpret_cast<EGLNativeWindowType>(ws.egl_window), nullptr);
-    constexpr EGLint ctx_attribs[] = {
-        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE
-    };
-    EGLContext egl_ctx = eglCreateContext(egl_disp, egl_cfg, EGL_NO_CONTEXT, ctx_attribs);
-    eglMakeCurrent(egl_disp, egl_surf, egl_surf, egl_ctx);
-
-    // --- ImGui ------------------------------------------------------------
+    IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize  = ImVec2(float(ws.width), float(ws.height));
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.DisplaySize = ImVec2(static_cast<float>(g_wl.width), static_cast<float>(g_wl.height));
+    ImGui::StyleColorsDark();
+    ImVec4* colors = ImGui::GetStyle().Colors;
+    colors[ImGuiCol_WindowBg]       = ImVec4(0.07f, 0.07f, 0.09f, 0.97f);
+    colors[ImGuiCol_TitleBgActive]  = ImVec4(0.20f, 0.0f,  0.35f, 1.0f);
+    colors[ImGuiCol_Button]         = ImVec4(0.14f, 0.0f,  0.22f, 1.0f);
+    colors[ImGuiCol_ButtonHovered]  = ImVec4(0.28f, 0.0f,  0.48f, 1.0f);
+
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    apply_theme();
 
-    SL_INFO("Audio Mixer UI ready");
+    // PipeWire client + mixer
+    PipeWireClient pw_client;
+    {
+        auto res = pw_client.connect();
+        if (!res.has_value()) {
+            SL_LOG_WARN("mixer", "PipeWire connect failed: {}", res.error().message());
+        }
+    }
+    AudioMixer mixer(pw_client);
+    // Initial node sync (PipeWire events may not have fired yet)
+    pw_client.nodes(); // trigger registry roundtrip
+    mixer.sync_nodes();
 
-    auto last_tick = std::chrono::steady_clock::now();
+    int selected_sink_idx = 0;
 
-    // --- Main loop --------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Main loop
+    // ---------------------------------------------------------------------------
     while (g_running.load(std::memory_order_relaxed)) {
-        wl_display_dispatch_pending(ws.display);
-        wl_display_flush(ws.display);
+        wl_display_dispatch_pending(g_wl.display);
+        if (wl_display_flush(g_wl.display) < 0) break;
 
-        if (ws.needs_resize) {
-            ws.needs_resize = false;
-            wl_egl_window_resize(ws.egl_window, ws.width, ws.height, 0, 0);
-            io.DisplaySize = ImVec2(float(ws.width), float(ws.height));
+        mixer.update_meters();
+        mixer.sync_nodes();
+
+        if (g_wl.width != static_cast<int>(io.DisplaySize.x) ||
+            g_wl.height != static_cast<int>(io.DisplaySize.y)) {
+            wl_egl_window_resize(g_egl.window, g_wl.width, g_wl.height, 0, 0);
         }
 
-        // Tick mixer peak decay
-        auto now = std::chrono::steady_clock::now();
-        float dt = std::chrono::duration<float>(now - last_tick).count();
-        last_tick = now;
-        mixer.tick(dt);
+        io.DisplaySize = ImVec2(static_cast<float>(g_wl.width),
+                                static_cast<float>(g_wl.height));
+        io.DeltaTime   = 1.0f / 60.0f;
+        io.MousePos    = ImVec2(g_wl.mouse_x, g_wl.mouse_y);
+        for (int b = 0; b < 5; ++b) io.MouseDown[b] = g_wl.mouse_buttons[b];
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-        ImGui::SetNextWindowSize(io.DisplaySize);
-        constexpr ImGuiWindowFlags kWin =
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoBringToDisplayFront;
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(g_wl.width),
+                                        static_cast<float>(g_wl.height)), ImGuiCond_Always);
+        ImGui::Begin("##mixer_root", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_MenuBar);
 
-        if (ImGui::Begin("##AudioMixer", nullptr, kWin)) {
-            // Title
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 1.0f, 0.67f, 1.0f));
-            ImGui::Text("STRAYLIGHT AUDIO MIXER");
+        // Menu bar
+        if (ImGui::BeginMenuBar()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.4f, 1.0f, 1.0f));
+            ImGui::TextUnformatted("StrayLight Audio Mixer");
             ImGui::PopStyleColor();
-            ImGui::SameLine(io.DisplaySize.x - 60.0f);
-            if (ImGui::SmallButton("Close"))
-                g_running.store(false, std::memory_order_relaxed);
-            ImGui::Separator();
-
-            const auto channels = mixer.channels();
-            const auto sinks    = mixer.sinks();
-
-            if (channels.empty()) {
-                ImGui::Spacing();
-                ImGui::TextDisabled("No audio streams detected. "
-                                    "Start a media application to see channels.");
-            } else {
-                // Horizontal scrolling mixer board
-                if (ImGui::BeginChild("##mixer_board",
-                                      ImVec2(0.0f, io.DisplaySize.y - 80.0f),
-                                      false,
-                                      ImGuiWindowFlags_HorizontalScrollbar)) {
-                    constexpr float kStripWidth = 100.0f;
-                    constexpr float kStripPad   = 8.0f;
-
-                    // Section: Output Devices
-                    bool has_devices = false;
-                    for (const auto& ch : channels) {
-                        if (ch.node.is_device()) { has_devices = true; break; }
-                    }
-                    if (has_devices) {
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                              ImVec4(0.0f, 1.0f, 0.67f, 1.0f));
-                        ImGui::TextUnformatted("OUTPUT DEVICES");
-                        ImGui::PopStyleColor();
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        bool first_dev = true;
-                        for (const auto& ch : channels) {
-                            if (!ch.node.is_device()) continue;
-                            if (!first_dev) ImGui::SameLine(0.0f, kStripPad);
-                            first_dev = false;
-                            draw_channel_strip(mixer, ch, sinks);
-                        }
-                        ImGui::Spacing();
-                        ImGui::Separator();
-                        ImGui::Spacing();
-                    }
-
-                    // Section: Application Streams
-                    bool has_streams = false;
-                    for (const auto& ch : channels) {
-                        if (!ch.node.is_device()) { has_streams = true; break; }
-                    }
-                    if (has_streams) {
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                              ImVec4(0.0f, 1.0f, 0.67f, 1.0f));
-                        ImGui::TextUnformatted("APPLICATION STREAMS");
-                        ImGui::PopStyleColor();
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        bool first_stream = true;
-                        for (const auto& ch : channels) {
-                            if (ch.node.is_device()) continue;
-                            if (!first_stream) ImGui::SameLine(0.0f, kStripPad);
-                            first_stream = false;
-                            draw_channel_strip(mixer, ch, sinks);
-                        }
-                    }
-                }
-                ImGui::EndChild();
+            ImGui::SameLine(0, 20);
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Quit"))
+                    g_running.store(false, std::memory_order_relaxed);
+                ImGui::EndMenu();
             }
-
-            // Status bar
-            ImGui::Separator();
-            size_t n_streams = 0;
-            for (const auto& ch : channels) if (!ch.node.is_device()) ++n_streams;
-            ImGui::TextDisabled("%zu total | %zu app streams | %zu sinks",
-                                channels.size(), n_streams, sinks.size());
+            ImGui::EndMenuBar();
         }
+
+        const float avail_w = ImGui::GetContentRegionAvail().x;
+        const float avail_h = ImGui::GetContentRegionAvail().y;
+
+        // Output device selector
+        {
+            const auto sink_names = mixer.sink_names();
+            const auto sink_ids   = mixer.sink_ids();
+
+            ImGui::Text("Output Device:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(250.0f);
+
+            // Build combo items string
+            std::string combo_items;
+            for (const auto& s : sink_names) { combo_items += s; combo_items += '\0'; }
+            combo_items += '\0';
+
+            if (sink_names.empty()) {
+                ImGui::TextDisabled("(no sinks detected)");
+            } else {
+                if (selected_sink_idx >= static_cast<int>(sink_names.size()))
+                    selected_sink_idx = 0;
+                ImGui::Combo("##sink_sel", &selected_sink_idx, combo_items.c_str());
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Channel strips
+        const auto& nodes = mixer.node_infos();
+        if (nodes.empty()) {
+            ImGui::SetCursorPosY(avail_h * 0.4f);
+            ImGui::SetCursorPosX((avail_w - ImGui::CalcTextSize("No audio streams detected").x) * 0.5f);
+            ImGui::TextDisabled("No audio streams detected");
+            if (ImGui::Button("Refresh")) mixer.sync_nodes();
+        } else {
+            const float strip_h = avail_h - 80.0f;
+            const float strip_w = std::max(55.0f,
+                std::min(90.0f, (avail_w - 20.0f) / static_cast<float>(nodes.size())));
+
+            ImGui::BeginChild("##strips", ImVec2(0, strip_h), false,
+                               ImGuiWindowFlags_HorizontalScrollbar);
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                if (i > 0) ImGui::SameLine(0, 4);
+                draw_channel_strip(mixer, nodes[i], strip_w, strip_h - 4.0f);
+            }
+            ImGui::EndChild();
+        }
+
+        // Bottom: master volume
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::Text("Master");
+        ImGui::SameLine();
+        // Master fader — controls the default sink if available
+        const auto sink_ids = mixer.sink_ids();
+        if (!sink_ids.empty()) {
+            float master_vol = mixer.get_volume(sink_ids[0]);
+            ImGui::SetNextItemWidth(300.0f);
+            if (ImGui::SliderFloat("##master", &master_vol, 0.0f, 1.0f,
+                                    "%.0f%%", ImGuiSliderFlags_None)) {
+                mixer.set_volume(sink_ids[0], master_vol);
+            }
+            bool master_mute = mixer.get_muted(sink_ids[0]);
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Mute##master", &master_mute))
+                mixer.set_mute(sink_ids[0], master_mute);
+        }
+
         ImGui::End();
 
+        // Render
         ImGui::Render();
-        glViewport(0, 0, ws.width, ws.height);
-        glClearColor(0.08f, 0.08f, 0.13f, 1.0f);
+        glViewport(0, 0, g_wl.width, g_wl.height);
+        glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        eglSwapBuffers(egl_disp, egl_surf);
-
-        usleep(16000);
+        eglSwapBuffers(g_egl.display, g_egl.surface);
     }
 
-    // --- Cleanup ----------------------------------------------------------
-    SL_INFO("Audio Mixer shutting down");
-    pw.stop();
-
+    pw_client.disconnect();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui::DestroyContext();
-
-    eglMakeCurrent(egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    eglDestroySurface(egl_disp, egl_surf);
-    eglDestroyContext(egl_disp, egl_ctx);
-    eglTerminate(egl_disp);
-
-    wl_egl_window_destroy(ws.egl_window);
-    xdg_toplevel_destroy(ws.toplevel);
-    xdg_surface_destroy(ws.xdg_surface_ptr);
-    wl_surface_destroy(ws.surface);
-    if (ws.seat) wl_seat_destroy(ws.seat);
-    xdg_wm_base_destroy(ws.xdg_wm_base_ptr);
-    wl_compositor_destroy(ws.compositor);
-    wl_registry_destroy(ws.registry);
-    wl_display_disconnect(ws.display);
-
-    SL_INFO("Audio Mixer exited cleanly");
-    return EXIT_SUCCESS;
+    egl_shutdown();
+    wayland_shutdown();
+    return 0;
 }

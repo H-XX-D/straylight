@@ -1,0 +1,10 @@
+straylight-compositor (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * straylight-compositor: wlroots-based Wayland compositor
+  * Tiling layout engine with workspace management
+  * Layer-shell protocol support for panels and docks
+  * Session lock with PAM authentication
+  * D-Bus IPC via org.straylight.Compositor1
+
+ -- StrayLight OS Team <dev@straylight.dev>  Sun, 16 Mar 2026 00:00:00 +0000

@@ -1,0 +1,35 @@
+Source: straylight-compositor
+Section: x11
+Priority: optional
+Maintainer: StrayLight OS Team <dev@straylight.dev>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.25),
+               pkg-config,
+               libstraylight-common-dev (>= 1.0.0),
+               libwlroots-dev (>= 0.18),
+               libwayland-dev (>= 1.22),
+               wayland-protocols (>= 1.34),
+               libinput-dev (>= 1.25),
+               libpixman-1-dev (>= 0.42),
+               libegl-dev,
+               libgles-dev,
+               libpam0g-dev,
+               libsdbus-c++-dev (>= 2.0)
+Standards-Version: 4.6.2
+Homepage: https://straylight.dev
+Rules-Requires-Root: no
+
+Package: straylight-compositor
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libstraylight-common1 (>= 1.0.0),
+         straylight-core (>= 1.0.0),
+         libwlroots12 (>= 0.18),
+         libwayland-server0 (>= 1.22),
+         libinput10 (>= 1.25),
+         xwayland
+Description: StrayLight OS Wayland compositor and shell
+ Wayland compositor based on wlroots 0.18 with ImGui desktop shell.
+ Provides tiling window management, layer-shell panels, session lock,
+ multi-output support, and D-Bus IPC for shell integration.

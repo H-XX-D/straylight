@@ -1,0 +1,5 @@
+usr/bin/straylight-compositor
+usr/bin/straylight-shell
+usr/share/wayland-sessions/straylight.desktop
+etc/straylight/compositor/straylight-compositor.conf
+etc/straylight/shell/straylight-shell.conf

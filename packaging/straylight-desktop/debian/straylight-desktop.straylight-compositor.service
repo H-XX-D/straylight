@@ -1,0 +1,21 @@
+[Unit]
+Description=StrayLight Wayland Compositor
+Documentation=https://straylight.dev/docs/compositor
+After=systemd-logind.service dbus.service
+Requires=dbus.service
+ConditionPathExists=/dev/dri/card0
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/straylight-compositor
+Restart=on-failure
+RestartSec=2s
+User=root
+Environment=WLR_BACKENDS=drm
+Environment=WLR_RENDERER=gles2
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+LimitNOFILE=65536
+WatchdogSec=30s
+
+[Install]
+WantedBy=graphical.target

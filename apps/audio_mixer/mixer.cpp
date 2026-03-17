@@ -1,8 +1,6 @@
 // apps/audio_mixer/mixer.cpp
-// Mixer model: channel management, peak meter decay, device routing
+// AudioMixer implementation — wraps PipeWireClient with UI-facing model.
 #include "mixer.h"
-
-#include <straylight/log.h>
 
 #include <algorithm>
 #include <cmath>
@@ -10,201 +8,163 @@
 namespace straylight::mixer {
 
 // ---------------------------------------------------------------------------
-// MixerChannel helpers
+// PeakMeter
 // ---------------------------------------------------------------------------
 
-float MixerChannel::master_volume() const {
-    if (node.channel_volumes.empty()) return 0.0f;
-    float sum = 0.0f;
-    for (float v : node.channel_volumes) sum += v;
-    return sum / float(node.channel_volumes.size());
-}
+void PeakMeter::push(float linear_peak) {
+    ring[static_cast<size_t>(head)] = linear_peak;
+    head = (head + 1) % kRingLen;
 
-const std::string& MixerChannel::label() const {
-    return node.app_name.empty() ? node.name : node.app_name;
-}
-
-// ---------------------------------------------------------------------------
-// Mixer helpers
-// ---------------------------------------------------------------------------
-
-float Mixer::to_db(float linear) {
-    if (linear <= 0.0f) return kMinDb;
-    return std::max(kMinDb, 20.0f * std::log10(linear));
-}
-
-float Mixer::from_db(float db) {
-    return std::pow(10.0f, db / 20.0f);
+    // Peak hold
+    if (linear_peak >= peak_hold) {
+        peak_hold   = linear_peak;
+        hold_frames = 45;
+    } else {
+        if (hold_frames > 0) --hold_frames;
+        else peak_hold = std::max(0.0f, peak_hold - 0.008f);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// refresh() — rebuild the channel list from the PW snapshot
+// AudioMixer
 // ---------------------------------------------------------------------------
 
-void Mixer::refresh() {
-    const auto nodes = pw_.nodes();
+AudioMixer::AudioMixer(PipeWireClient& client) : client_(client) {
+    // Register for node changes
+    client_.on_nodes_changed([this](std::vector<PwNodeInfo> nodes) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        nodes_ = std::move(nodes);
+        // Merge states: preserve existing, add new, remove stale
+        for (const auto& n : nodes_) {
+            bool found = false;
+            for (auto& s : states_) {
+                if (s.id == n.id) { found = true; break; }
+            }
+            if (!found) {
+                NodeState ns;
+                ns.id     = n.id;
+                ns.volume = n.volume;
+                ns.muted  = n.muted;
+                states_.push_back(std::move(ns));
+            }
+        }
+        // Remove states for nodes no longer present
+        states_.erase(
+            std::remove_if(states_.begin(), states_.end(), [this](const NodeState& s) {
+                for (const auto& n : nodes_)
+                    if (n.id == s.id) return false;
+                return true;
+            }),
+            states_.end());
+    });
+}
 
-    std::lock_guard lock(mtx_);
-
-    // Preserve existing meter data for nodes that still exist
-    for (auto& ch : channels_) {
+void AudioMixer::sync_nodes() {
+    auto fresh = client_.nodes();
+    std::lock_guard<std::mutex> lk(mtx_);
+    nodes_ = std::move(fresh);
+    for (const auto& n : nodes_) {
         bool found = false;
-        for (const auto& n : nodes) {
-            if (n.id == ch.node.id) {
-                found = true;
-                // Update volume/mute state from fresh data, keep meters
-                ch.node.channel_volumes = n.channel_volumes;
-                ch.node.muted           = n.muted;
-                ch.node.name            = n.name;
-                ch.node.app_name        = n.app_name;
-                // Resize meters if channel count changed
-                if (ch.meters.size() != n.channel_volumes.size()) {
-                    ch.meters.assign(n.channel_volumes.size(), PeakSample{});
-                }
-                break;
-            }
-        }
-        if (!found) ch.node.id = 0; // Mark for removal
-    }
-
-    // Remove stale channels
-    channels_.erase(
-        std::remove_if(channels_.begin(), channels_.end(),
-                       [](const MixerChannel& c){ return c.node.id == 0; }),
-        channels_.end());
-
-    // Add new nodes
-    for (const auto& n : nodes) {
-        bool existing = false;
-        for (const auto& ch : channels_) {
-            if (ch.node.id == n.id) { existing = true; break; }
-        }
-        if (!existing) {
-            MixerChannel ch;
-            ch.node   = n;
-            ch.meters.assign(
-                std::max(size_t(2), n.channel_volumes.size()),
-                PeakSample{});
-            channels_.push_back(std::move(ch));
-        }
-    }
-
-    // Sort: sinks first, then streams alphabetically by label
-    std::stable_sort(channels_.begin(), channels_.end(),
-        [](const MixerChannel& a, const MixerChannel& b) {
-            bool a_dev = a.node.is_device();
-            bool b_dev = b.node.is_device();
-            if (a_dev != b_dev) return a_dev > b_dev;
-            return a.label() < b.label();
-        });
-}
-
-// ---------------------------------------------------------------------------
-// tick() — decay peak meters each frame
-// ---------------------------------------------------------------------------
-
-void Mixer::tick(float dt) {
-    std::lock_guard lock(mtx_);
-    const float decay = kPeakDecayPerSecond * dt;
-    for (auto& ch : channels_) {
-        for (auto& m : ch.meters) {
-            // Exponential-ish decay
-            m.peak = std::max(0.0f, m.peak - decay);
-            m.rms  = std::max(0.0f, m.rms  - decay * 2.0f);
+        for (auto& s : states_)
+            if (s.id == n.id) { found = true; break; }
+        if (!found) {
+            NodeState ns;
+            ns.id = n.id; ns.volume = n.volume; ns.muted = n.muted;
+            states_.push_back(std::move(ns));
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// push_peak()
-// ---------------------------------------------------------------------------
-
-void Mixer::push_peak(uint32_t node_id, const std::vector<float>& peaks) {
-    std::lock_guard lock(mtx_);
-    for (auto& ch : channels_) {
-        if (ch.node.id == node_id) {
-            if (ch.meters.size() < peaks.size()) {
-                ch.meters.resize(peaks.size());
-            }
-            for (size_t i = 0; i < peaks.size(); ++i) {
-                float p = std::clamp(peaks[i], 0.0f, 1.0f);
-                if (p > ch.meters[i].peak) ch.meters[i].peak = p;
-                ch.meters[i].rms = p * 0.7f + ch.meters[i].rms * 0.3f;
-            }
-            break;
-        }
-    }
+AudioMixer::NodeState* AudioMixer::find_state(uint32_t id) {
+    for (auto& s : states_) if (s.id == id) return &s;
+    return nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// channels() / sinks()
-// ---------------------------------------------------------------------------
-
-std::vector<MixerChannel> Mixer::channels() const {
-    std::lock_guard lock(mtx_);
-    return channels_;
+const AudioMixer::NodeState* AudioMixer::find_state(uint32_t id) const {
+    for (const auto& s : states_) if (s.id == id) return &s;
+    return nullptr;
 }
 
-std::vector<MixerChannel> Mixer::sinks() const {
-    std::lock_guard lock(mtx_);
-    std::vector<MixerChannel> result;
-    for (const auto& ch : channels_) {
-        if (ch.node.media_class == "Audio/Sink") result.push_back(ch);
-    }
-    return result;
+float AudioMixer::get_volume(uint32_t node_id) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const NodeState* s = find_state(node_id);
+    return s ? s->volume : 1.0f;
 }
 
-// ---------------------------------------------------------------------------
-// Volume / mute control
-// ---------------------------------------------------------------------------
-
-void Mixer::set_master_volume(uint32_t node_id, float vol) {
-    vol = std::clamp(vol, 0.0f, 1.5f);
-
-    // Update local state immediately for responsive UI
+void AudioMixer::set_volume(uint32_t node_id, float vol) {
+    vol = std::clamp(vol, 0.0f, 1.0f);
     {
-        std::lock_guard lock(mtx_);
-        for (auto& ch : channels_) {
-            if (ch.node.id == node_id) {
-                for (auto& v : ch.node.channel_volumes) v = vol;
-                break;
-            }
+        std::lock_guard<std::mutex> lk(mtx_);
+        NodeState* s = find_state(node_id);
+        if (s) {
+            s->volume = vol;
+            s->simulated_activity = vol; // drive peak meter from volume activity
         }
     }
-
-    // Build volume vector matching channel count
-    std::vector<float> vols;
-    {
-        std::lock_guard lock(mtx_);
-        for (const auto& ch : channels_) {
-            if (ch.node.id == node_id) {
-                vols.assign(ch.node.channel_volumes.size(), vol);
-                break;
-            }
-        }
-    }
-    if (vols.empty()) vols = {vol, vol};
-    (void)pw_.set_volume(node_id, vols);
+    client_.set_volume(node_id, vol);
 }
 
-void Mixer::toggle_mute(uint32_t node_id) {
-    bool new_mute = false;
-    {
-        std::lock_guard lock(mtx_);
-        for (auto& ch : channels_) {
-            if (ch.node.id == node_id) {
-                ch.node.muted = !ch.node.muted;
-                new_mute = ch.node.muted;
-                break;
-            }
-        }
-    }
-    (void)pw_.set_mute(node_id, new_mute);
+bool AudioMixer::get_muted(uint32_t node_id) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const NodeState* s = find_state(node_id);
+    return s ? s->muted : false;
 }
 
-void Mixer::route_stream(uint32_t stream_node_id, uint32_t sink_node_id) {
-    (void)pw_.route_to_sink(stream_node_id, sink_node_id);
-    SL_INFO("Mixer: routing stream {} to sink {}", stream_node_id, sink_node_id);
+void AudioMixer::set_mute(uint32_t node_id, bool muted) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        NodeState* s = find_state(node_id);
+        if (s) s->muted = muted;
+    }
+    client_.set_mute(node_id, muted);
+}
+
+float AudioMixer::get_peak(uint32_t node_id) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const NodeState* s = find_state(node_id);
+    return s ? s->meter.current_peak() : 0.0f;
+}
+
+void AudioMixer::update_meters() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (auto& s : states_) {
+        if (s.muted) {
+            s.meter.push(0.0f);
+            continue;
+        }
+        // Simulate activity: random flutter around volume level
+        // (In a real system we'd read the PipeWire meter events)
+        const float base    = s.volume;
+        const float flutter = base * 0.15f *
+            std::abs(std::sin(static_cast<float>(s.id * 7 +
+                               std::hash<std::string>{}(std::to_string(s.id)))));
+        s.simulated_activity = std::max(0.0f, base - flutter + flutter * 0.5f);
+        s.meter.push(s.simulated_activity);
+    }
+}
+
+std::vector<std::string> AudioMixer::sink_names() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<std::string> names;
+    for (const auto& n : nodes_) {
+        if (n.media_class.find("Audio/Sink") != std::string::npos) {
+            names.push_back(n.nick.empty() ? n.name : n.nick);
+        }
+    }
+    return names;
+}
+
+std::vector<uint32_t> AudioMixer::sink_ids() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::vector<uint32_t> ids;
+    for (const auto& n : nodes_)
+        if (n.media_class.find("Audio/Sink") != std::string::npos)
+            ids.push_back(n.id);
+    return ids;
+}
+
+const std::vector<PwNodeInfo>& AudioMixer::node_infos() const {
+    return nodes_;
 }
 
 } // namespace straylight::mixer

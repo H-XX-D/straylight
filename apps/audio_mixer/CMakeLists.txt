@@ -26,16 +26,18 @@ if(WAYLAND_SCANNER AND EXISTS "${XDG_SHELL_PROTOCOL}")
     add_custom_command(
         OUTPUT ${XDG_SHELL_HEADER}
         COMMAND ${WAYLAND_SCANNER} client-header ${XDG_SHELL_PROTOCOL} ${XDG_SHELL_HEADER}
-        DEPENDS ${XDG_SHELL_PROTOCOL}
-        COMMENT "Generating xdg-shell client header")
+        DEPENDS ${XDG_SHELL_PROTOCOL})
     add_custom_command(
         OUTPUT ${XDG_SHELL_CODE}
         COMMAND ${WAYLAND_SCANNER} private-code ${XDG_SHELL_PROTOCOL} ${XDG_SHELL_CODE}
-        DEPENDS ${XDG_SHELL_PROTOCOL}
-        COMMENT "Generating xdg-shell protocol code")
+        DEPENDS ${XDG_SHELL_PROTOCOL})
     target_sources(straylight-audio-mixer PRIVATE ${XDG_SHELL_HEADER} ${XDG_SHELL_CODE})
     target_include_directories(straylight-audio-mixer PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 endif()
+
+target_include_directories(straylight-audio-mixer PRIVATE
+    ${PIPEWIRE_INCLUDE_DIRS}
+)
 
 target_link_libraries(straylight-audio-mixer PRIVATE
     straylight-common
@@ -44,11 +46,10 @@ target_link_libraries(straylight-audio-mixer PRIVATE
     ${GLES_LIBRARIES}
     ${PIPEWIRE_LIBRARIES}
     imgui
-    spdlog::spdlog
 )
 
-target_include_directories(straylight-audio-mixer PRIVATE
-    ${PIPEWIRE_INCLUDE_DIRS}
+target_compile_options(straylight-audio-mixer PRIVATE
+    ${PIPEWIRE_CFLAGS_OTHER}
 )
 
 target_compile_features(straylight-audio-mixer PRIVATE cxx_std_20)

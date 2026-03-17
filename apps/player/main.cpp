@@ -291,11 +291,11 @@ int main(int argc, char* argv[]) {
     PlaybackEngine::gst_init_once(&argc, &argv);
 
     if (!wayland_init()) {
-        SL_LOG_ERROR("player", "Wayland init failed");
+        SL_ERROR("Wayland init failed");
         return 1;
     }
     if (!egl_init()) {
-        SL_LOG_ERROR("player", "EGL init failed");
+        SL_ERROR("EGL init failed");
         return 1;
     }
 
@@ -334,7 +334,7 @@ int main(int argc, char* argv[]) {
         }
     });
     engine.on_error([](const std::string& msg) {
-        SL_LOG_ERROR("player", "Playback error: {}", msg);
+        SL_ERROR("Playback error: {}", msg);
     });
 
     // Load files from command-line arguments

@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --with dkms
+
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+override_dh_auto_install:
+	# DKMS source trees are installed directly
+	install -d debian/straylight-kernel/usr/src
+	for mod in vpu hypervisor scheduler xdp entropy enclave; do \
+		cp -a kernel/$$mod debian/straylight-kernel/usr/src/straylight-$$mod-1.0.0; \
+		install -m 644 kernel/dkms/straylight-$$mod-dkms/dkms.conf \
+			debian/straylight-kernel/usr/src/straylight-$$mod-1.0.0/dkms.conf; \
+	done
+
+override_dh_dkms:
+	dh_dkms -V 1.0.0

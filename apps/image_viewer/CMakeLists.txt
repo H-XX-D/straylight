@@ -41,6 +41,7 @@ target_link_libraries(straylight-image-viewer PRIVATE
     ${EGL_LIBRARIES}
     ${GLES_LIBRARIES}
     imgui
+    stb
 )
 
 target_compile_features(straylight-image-viewer PRIVATE cxx_std_20)
