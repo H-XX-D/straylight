@@ -52,6 +52,13 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(services/replay)
     add_subdirectory(tools/replay-cli)
     add_subdirectory(tools/bench)
+    add_subdirectory(tools/vault)
+    add_subdirectory(tools/probe)
+    add_subdirectory(services/cron)
+    add_subdirectory(tools/cron-cli)
+    add_subdirectory(tools/migrate)
+    add_subdirectory(services/health)
+    add_subdirectory(tools/health-cli)
 endif()
 
 # Compositor
