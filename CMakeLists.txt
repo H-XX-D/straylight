@@ -49,6 +49,9 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(tools/alice-cli)
     add_subdirectory(tools/snapshot)
     add_subdirectory(tools/sandbox)
+    add_subdirectory(services/replay)
+    add_subdirectory(tools/replay-cli)
+    add_subdirectory(tools/bench)
 endif()
 
 # Compositor
