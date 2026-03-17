@@ -85,6 +85,8 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(tools/update)
     add_subdirectory(tools/log)
     add_subdirectory(tools/users)
+    add_subdirectory(services/voice)
+    add_subdirectory(tools/voice-cli)
 endif()
 
 # Compositor
