@@ -3,6 +3,6 @@
 
 obj-m := straylight-vpu.o
 
-straylight-vpu-y := vpu_main.o vpu_slab.o vpu_ioctl.o vpu_dma.o vpu_sysfs.o
+straylight-vpu-y := vpu_main.o vpu_slab.o vpu_ioctl.o vpu_dma.o vpu_sysfs.o vpu_mgpu.o
 
 ccflags-y := -std=gnu11 -DSTRAYLIGHT_VPU

@@ -1,5 +1,6 @@
 add_library(straylight-hw SHARED
     src/gpu.cpp
+    src/mgpu.cpp
     src/entropy.cpp
 )
 

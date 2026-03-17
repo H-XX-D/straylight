@@ -45,6 +45,8 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/rdma_bus)
     add_subdirectory(bin/enclave)
     add_subdirectory(bin/fuse)
+    add_subdirectory(services/alice)
+    add_subdirectory(tools/alice-cli)
 endif()
 
 # Compositor
