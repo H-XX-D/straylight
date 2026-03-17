@@ -47,6 +47,8 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(bin/fuse)
     add_subdirectory(services/alice)
     add_subdirectory(tools/alice-cli)
+    add_subdirectory(tools/snapshot)
+    add_subdirectory(tools/sandbox)
 endif()
 
 # Compositor
