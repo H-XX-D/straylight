@@ -59,6 +59,10 @@ if(BUILD_SUBSYSTEMS)
     add_subdirectory(tools/migrate)
     add_subdirectory(services/health)
     add_subdirectory(tools/health-cli)
+    add_subdirectory(services/flux)
+    add_subdirectory(tools/flux-cli)
+    add_subdirectory(tools/trace)
+    add_subdirectory(tools/garden)
 endif()
 
 # Compositor
@@ -66,9 +70,10 @@ if(BUILD_COMPOSITOR)
     add_subdirectory(compositor)
 endif()
 
-# Shell, Greeter, OOBE, Wizard
+# Shell, Greeter, OOBE, Wizard, Extensions
 if(BUILD_SHELL)
     add_subdirectory(shell)
+    add_subdirectory(shell/extensions)
     add_subdirectory(apps/greeter)
     add_subdirectory(apps/oobe)
     add_subdirectory(apps/wizard)
@@ -89,6 +94,7 @@ if(BUILD_APPS)
     add_subdirectory(apps/shield-gui)
     add_subdirectory(apps/migrate-gui)
     add_subdirectory(apps/mesh-gui)
+    add_subdirectory(apps/hub)
 endif()
 
 # Tests
